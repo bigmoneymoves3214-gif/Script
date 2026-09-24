@@ -2171,53 +2171,58 @@ local TabSettings  = Window.new_tab(ICONS.settings,  "Settings")
 
 yield()
 
+-- Sections are only touched while the menu is being built, so they live in
+-- this table rather than each taking a local slot - the main chunk is close
+-- to Lua's 200-local ceiling and the sectors below need those slots.
+local UI = {}
+
 -- Player
-local SecPlayerMain   = TabPlayer.new_section("General")
-local BoxMovement     = SecPlayerMain.new_sector("Movement", "Left")
-local BoxProtection   = SecPlayerMain.new_sector("Protection", "Right")
+UI.secPlayer         = TabPlayer.new_section("General")
+UI.boxMovement       = UI.secPlayer.new_sector("Movement", "Left")
+UI.boxProtection     = UI.secPlayer.new_sector("Protection", "Right")
+UI.playerUtil        = UI.secPlayer.new_sector("Utility", "Right")
 
 -- Visuals
-local SecVisPlayers   = TabVisuals.new_section("Players")
-local BoxPlayerESP    = SecVisPlayers.new_sector("Player ESP", "Left")
-local BoxPlayerESPOpt = SecVisPlayers.new_sector("Options", "Right")
+UI.secVisPlayers     = TabVisuals.new_section("Players")
+UI.boxPlayerESP      = UI.secVisPlayers.new_sector("Player ESP", "Left")
+UI.boxPlayerESPOpt   = UI.secVisPlayers.new_sector("Options", "Right")
 
-local SecVisMobs      = TabVisuals.new_section("Mobs")
-local BoxMobESP       = SecVisMobs.new_sector("Mob ESP", "Left")
-local BoxMobESPOpt    = SecVisMobs.new_sector("Options", "Right")
+UI.secVisMobs        = TabVisuals.new_section("Mobs")
+UI.boxMobESP         = UI.secVisMobs.new_sector("Mob ESP", "Left")
+UI.boxMobESPOpt      = UI.secVisMobs.new_sector("Options", "Right")
 
-local UI              = {}
-UI.secWorld           = TabVisuals.new_section("World")
-UI.itemESP            = UI.secWorld.new_sector("Item ESP", "Left")
-UI.camera             = UI.secWorld.new_sector("Camera", "Right")
-UI.worldVisuals       = UI.secWorld.new_sector("World Visuals", "Left")
+UI.secWorld          = TabVisuals.new_section("World")
+UI.itemESP           = UI.secWorld.new_sector("Item ESP", "Left")
+UI.camera            = UI.secWorld.new_sector("Camera", "Right")
+UI.worldVisuals      = UI.secWorld.new_sector("World Visuals", "Left")
 
 -- Teleports
-local SecTpLocations  = TabTeleports.new_section("Locations")
-local BoxChakraPoints = SecTpLocations.new_sector("Chakra Points", "Left")
-local BoxFruits       = SecTpLocations.new_sector("Fruits", "Right")
+UI.secTpLocations    = TabTeleports.new_section("Locations")
+UI.boxChakraPoints   = UI.secTpLocations.new_sector("Chakra Points", "Left")
+UI.boxFruits         = UI.secTpLocations.new_sector("Fruits", "Right")
 
-local SecTpPlayers    = TabTeleports.new_section("Players")
-local BoxTpPlayer     = SecTpPlayers.new_sector("Teleport to Player", "Left")
+UI.secTpPlayers      = TabTeleports.new_section("Players")
+UI.boxTpPlayer       = UI.secTpPlayers.new_sector("Teleport to Player", "Left")
 
 -- Misc
-local SecMiscData     = TabMisc.new_section("Data")
-local BoxViewData     = SecMiscData.new_sector("View Data", "Left")
-local BoxPurchase     = SecMiscData.new_sector("Purchase", "Right")
+UI.secMiscData       = TabMisc.new_section("Data")
+UI.boxViewData       = UI.secMiscData.new_sector("View Data", "Left")
+UI.boxPurchase       = UI.secMiscData.new_sector("Purchase", "Right")
 
-UI.secUtility         = TabMisc.new_section("Utility")
-UI.spectate           = UI.secUtility.new_sector("Spectate", "Left")
-UI.server             = UI.secUtility.new_sector("Server", "Right")
-UI.watchers           = UI.secUtility.new_sector("Watchers", "Left")
+UI.secUtility        = TabMisc.new_section("Utility")
+UI.spectate          = UI.secUtility.new_sector("Spectate", "Left")
+UI.server            = UI.secUtility.new_sector("Server", "Right")
+UI.watchers          = UI.secUtility.new_sector("Watchers", "Left")
 
 -- Security
-local SecSecurity     = TabSecurity.new_section("Protection")
-local BoxSafeTp       = SecSecurity.new_sector("Safe Teleport", "Left")
-local BoxDetection    = SecSecurity.new_sector("Detection", "Right")
+UI.secSecurity       = TabSecurity.new_section("Protection")
+UI.boxSafeTp         = UI.secSecurity.new_sector("Safe Teleport", "Left")
+UI.boxDetection      = UI.secSecurity.new_sector("Detection", "Right")
 
 -- Settings
-local SecSettings     = TabSettings.new_section("Configs")
-local BoxConfigs      = SecSettings.new_sector("Config", "Left")
-local BoxMenu         = SecSettings.new_sector("Menu", "Right")
+UI.secSettings       = TabSettings.new_section("Configs")
+UI.boxConfigs        = UI.secSettings.new_sector("Config", "Left")
+UI.boxMenu           = UI.secSettings.new_sector("Menu", "Right")
 
 yield(true)
 
@@ -2237,6 +2242,7 @@ K.flags = {
     noFallDamage     = false,
     antiVoid         = false,
     noVisualEffects  = false,
+    chakraCharge     = false,
 }
 
 local function character()
@@ -2481,7 +2487,7 @@ local function setNoclip(on)
     end
 end
 
-BoxMovement.element("Toggle", "Noclip", nil, function(v)
+UI.boxMovement.element("Toggle", "Noclip", nil, function(v)
     setNoclip(v.Toggle)
 end)
 
@@ -2574,7 +2580,7 @@ local function omniStart()
     end))
 end
 
-BoxMovement.element("Toggle", "Omnimovement", nil, function(v)
+UI.boxMovement.element("Toggle", "Omnimovement", nil, function(v)
     K.flags.omnimovement = v.Toggle
     if v.Toggle then
         omniStart()
@@ -2593,7 +2599,7 @@ end)
 ---------------------------------------------------------------------
 local staminaLoop = nil
 
-BoxMovement.element("Toggle", "Infinite Stamina", nil, function(v)
+UI.boxMovement.element("Toggle", "Infinite Stamina", nil, function(v)
     K.flags.infiniteStamina = v.Toggle
 
     if v.Toggle then
@@ -2618,13 +2624,13 @@ BoxMovement.element("Toggle", "Infinite Stamina", nil, function(v)
     end
 end)
 
-BoxMovement.create_line()
-BoxMovement.element("Label", "Menu keybind: Insert")
+UI.boxMovement.create_line()
+UI.boxMovement.element("Label", "Menu keybind: Insert")
 
 ---------------------------------------------------------------------
 -- NO FALL DAMAGE
 ---------------------------------------------------------------------
-BoxProtection.element("Toggle", "No Fall Damage", nil, function(v)
+UI.boxProtection.element("Toggle", "No Fall Damage", nil, function(v)
     K.flags.noFallDamage = v.Toggle
     if v.Toggle then installFeatureHook() end
     notify("Player", "No Fall Damage " .. (v.Toggle and "enabled" or "disabled"))
@@ -2652,7 +2658,7 @@ local function watchVoidPart(part)
     end))
 end
 
-BoxProtection.element("Toggle", "Anti Void", nil, function(v)
+UI.boxProtection.element("Toggle", "Anti Void", nil, function(v)
     K.flags.antiVoid = v.Toggle
 
     if v.Toggle then
@@ -2782,7 +2788,7 @@ local function restoreVisuals()
     Visual.original = nil
 end
 
-BoxProtection.element("Toggle", "No Visual Effects", nil, function(v)
+UI.boxProtection.element("Toggle", "No Visual Effects", nil, function(v)
     K.flags.noVisualEffects = v.Toggle
 
     if v.Toggle then
@@ -2816,6 +2822,103 @@ BoxProtection.element("Toggle", "No Visual Effects", nil, function(v)
         Visual.conns = {}
         restoreVisuals()
         notify("Player", "No Visual Effects disabled")
+    end
+end)
+
+---------------------------------------------------------------------
+-- INFINITE CHAKRA CHARGE
+--
+-- Charging is a server-side state the client opens by firing DataEvent
+-- "Charging", and the server closes on its own after a tick. The local
+-- HumanoidRootPart carries a "ChakraCharge" sound that plays for exactly as
+-- long as the charge is running, so the sound's Playing property is a free,
+-- exact signal for "the charge just ended" - no polling, no timers.
+--
+-- Each time it stops we re-open it with the same event the game itself sends,
+-- so the traffic is identical to a player holding the key down.
+--
+-- Two things the public version gets wrong and this does not:
+--   * It connects CharacterAdded every time the toggle is switched on and
+--     never disconnects it, so flipping the toggle a few times leaves several
+--     handlers stacked on the same event.
+--   * It has no floor on how often it can re-fire. A sound that flickers
+--     Playing (lag, an overlapping effect) turns into a FireServer spam loop,
+--     which is the one thing here that would actually stand out.
+---------------------------------------------------------------------
+local Charge = { conn = nil, respawnConn = nil, wasPlaying = false, last = 0 }
+
+local function chargeFire()
+    -- The game's own charge tick is about a second; anything faster than this
+    -- is the sound flickering, not a charge that really ended.
+    local now = os.clock()
+    if now - Charge.last < 0.15 then return end
+    Charge.last = now
+
+    pcall(function()
+        RepStorage:WaitForChild("Events"):WaitForChild("DataEvent"):FireServer("Charging")
+    end)
+end
+
+local function chargeAttach()
+    if Charge.conn then
+        unbind(Charge.conn)
+        Charge.conn = nil
+    end
+
+    local c   = character()
+    local hrp = c and c:FindFirstChild("HumanoidRootPart")
+    local sound = hrp and hrp:FindFirstChild("ChakraCharge")
+    if not sound then return end
+
+    Charge.wasPlaying = sound.Playing
+
+    -- Open the charge immediately if it is not already running, otherwise the
+    -- feature does nothing until the next time you charge by hand.
+    if not sound.Playing then
+        chargeFire()
+    end
+
+    Charge.conn = bind(sound:GetPropertyChangedSignal("Playing"):Connect(function()
+        if not K.flags.chakraCharge then return end
+
+        -- Only the falling edge matters: it just finished, so start it again.
+        if Charge.wasPlaying and not sound.Playing then
+            chargeFire()
+        end
+        Charge.wasPlaying = sound.Playing
+    end))
+end
+
+local function chargeStop()
+    if Charge.conn then
+        unbind(Charge.conn)
+        Charge.conn = nil
+    end
+    Charge.wasPlaying = false
+end
+
+UI.playerUtil.element("Toggle", "Infinite Chakra Charge", nil, function(v)
+    K.flags.chakraCharge = v.Toggle
+
+    if v.Toggle then
+        chargeAttach()
+
+        -- Bound once, not once per enable. The sound instance is recreated
+        -- with the character, so the watcher has to be rebuilt after a
+        -- respawn - but the respawn hook itself only needs to exist once.
+        if not Charge.respawnConn then
+            Charge.respawnConn = bind(LP.CharacterAdded:Connect(function()
+                if not K.flags.chakraCharge then return end
+                task.wait(1)
+                if not K.flags.chakraCharge then return end
+                chargeAttach()
+            end))
+        end
+
+        notify("Player", "Infinite Chakra Charge enabled")
+    else
+        chargeStop()
+        notify("Player", "Infinite Chakra Charge disabled")
     end
 end)
 
@@ -4179,7 +4282,7 @@ end
 -- V1 draws the whole readout as a screen overlay; V2 adorns a BillboardGui to
 -- the target instead. Boxes, tracers, arrows and the highlight are shared, so
 -- every other toggle below applies to both.
-BoxPlayerESP.element("Dropdown", "ESP Method", {
+UI.boxPlayerESP.element("Dropdown", "ESP Method", {
     options = { "V1", "V2" },
     default = { Dropdown = "V1" },
 }, function(v)
@@ -4196,7 +4299,7 @@ BoxPlayerESP.element("Dropdown", "ESP Method", {
     notify("Visuals", "ESP method: " .. ESP.method, 2)
 end)
 
-BoxPlayerESP.element("Toggle", "Enable Player ESP", nil, function(v)
+UI.boxPlayerESP.element("Toggle", "Enable Player ESP", nil, function(v)
     -- V2's text is a real GUI; only the shared box/tracer layer needs Drawing.
     if v.Toggle and ESP.method == "V1" and not drawingAvailable() then return end
 
@@ -4209,95 +4312,95 @@ BoxPlayerESP.element("Toggle", "Enable Player ESP", nil, function(v)
     notify("Visuals", "Player ESP " .. (v.Toggle and "enabled" or "disabled"))
 end)
 
-BoxPlayerESP.create_line()
+UI.boxPlayerESP.create_line()
 
-BoxPlayerESP.element("Toggle", "Show Name", ON, function(v)
+UI.boxPlayerESP.element("Toggle", "Show Name", ON, function(v)
     ESP.showName = v.Toggle
 end):add_color({ Color = ESP.nameColor }, false, function(c)
     ESP.nameColor = c.Color
 end)
 
-BoxPlayerESP.element("Toggle", "Show Distance", ON, function(v)
+UI.boxPlayerESP.element("Toggle", "Show Distance", ON, function(v)
     ESP.showDistance = v.Toggle
 end):add_color({ Color = ESP.distanceColor }, false, function(c)
     ESP.distanceColor = c.Color
 end)
 
-BoxPlayerESP.element("Toggle", "Show Health Text", ON, function(v)
+UI.boxPlayerESP.element("Toggle", "Show Health Text", ON, function(v)
     ESP.showHealthText = v.Toggle
 end)
 
-BoxPlayerESP.element("Toggle", "Show Health Bar", ON, function(v)
+UI.boxPlayerESP.element("Toggle", "Show Health Bar", ON, function(v)
     ESP.showHealthBar = v.Toggle
 end)
 
-BoxPlayerESP.element("Toggle", "Show Chakra Bar", ON, function(v)
+UI.boxPlayerESP.element("Toggle", "Show Chakra Bar", ON, function(v)
     ESP.showChakraBar = v.Toggle
 end):add_color({ Color = ESP.chakraColor }, false, function(c)
     ESP.chakraColor = c.Color
 end)
 
-BoxPlayerESP.element("Toggle", "Show Blood Bar", ON, function(v)
+UI.boxPlayerESP.element("Toggle", "Show Blood Bar", ON, function(v)
     ESP.showBloodBar = v.Toggle
 end):add_color({ Color = ESP.bloodColor }, false, function(c)
     ESP.bloodColor = c.Color
 end)
 
-BoxPlayerESP.create_line()
+UI.boxPlayerESP.create_line()
 
-BoxPlayerESP.element("Toggle", "Show Boxes", ON, function(v)
+UI.boxPlayerESP.element("Toggle", "Show Boxes", ON, function(v)
     ESP.showBoxes = v.Toggle
 end):add_color({ Color = ESP.boxColor }, false, function(c)
     ESP.boxColor = c.Color
 end)
 
-BoxPlayerESP.element("Toggle", "Show Tracers", nil, function(v)
+UI.boxPlayerESP.element("Toggle", "Show Tracers", nil, function(v)
     ESP.showTracers = v.Toggle
 end):add_color({ Color = ESP.tracerColor }, false, function(c)
     ESP.tracerColor = c.Color
 end)
 
-BoxPlayerESP.element("Toggle", "Show Highlight", nil, function(v)
+UI.boxPlayerESP.element("Toggle", "Show Highlight", nil, function(v)
     ESP.showHighlight = v.Toggle
 end):add_color({ Color = ESP.highlightFill }, false, function(c)
     ESP.highlightFill = c.Color
 end)
 
-BoxPlayerESP.create_line()
+UI.boxPlayerESP.create_line()
 
-BoxPlayerESP.element("Toggle", "Show Clan / Bloodline", ON, function(v)
+UI.boxPlayerESP.element("Toggle", "Show Clan / Bloodline", ON, function(v)
     ESP.showClan = v.Toggle
 end)
 
-BoxPlayerESP.element("Toggle", "Show Freshie Tag", ON, function(v)
+UI.boxPlayerESP.element("Toggle", "Show Freshie Tag", ON, function(v)
     ESP.showFreshie = v.Toggle
 end):add_color({ Color = ESP.freshieColor }, false, function(c)
     ESP.freshieColor = c.Color
 end)
 
-BoxPlayerESP.element("Toggle", "Show Awakened Mode", ON, function(v)
+UI.boxPlayerESP.element("Toggle", "Show Awakened Mode", ON, function(v)
     ESP.showAwakened = v.Toggle
 end):add_color({ Color = ESP.awakenedColor }, false, function(c)
     ESP.awakenedColor = c.Color
 end)
 
-BoxPlayerESP.element("Toggle", "Show Current Skill", nil, function(v)
+UI.boxPlayerESP.element("Toggle", "Show Current Skill", nil, function(v)
     ESP.showSkill = v.Toggle
 end)
 
-BoxPlayerESP.element("Toggle", "Show Combat Timer", nil, function(v)
+UI.boxPlayerESP.element("Toggle", "Show Combat Timer", nil, function(v)
     ESP.showCombatTimer = v.Toggle
 end):add_color({ Color = ESP.combatColor }, false, function(c)
     ESP.combatColor = c.Color
 end)
 
-BoxPlayerESP.element("Toggle", "Show Cooldowns", nil, function(v)
+UI.boxPlayerESP.element("Toggle", "Show Cooldowns", nil, function(v)
     ESP.showCooldowns = v.Toggle
 end):add_color({ Color = ESP.cooldownColor }, false, function(c)
     ESP.cooldownColor = c.Color
 end)
 
-BoxPlayerESP.element("Toggle", "Off-Screen Arrows", nil, function(v)
+UI.boxPlayerESP.element("Toggle", "Off-Screen Arrows", nil, function(v)
     ESP.showArrows = v.Toggle
 end):add_color({ Color = ESP.arrowColor }, false, function(c)
     ESP.arrowColor = c.Color
@@ -4305,64 +4408,64 @@ end)
 
 yield()
 
-BoxPlayerESPOpt.element("Toggle", "Team Check", nil, function(v)
+UI.boxPlayerESPOpt.element("Toggle", "Team Check", nil, function(v)
     ESP.teamCheck = v.Toggle
 end):add_color({ Color = ESP.teamColor }, false, function(c)
     ESP.teamColor = c.Color
 end)
 
-BoxPlayerESPOpt.element("Dropdown", "Tracer Origin", {
+UI.boxPlayerESPOpt.element("Dropdown", "Tracer Origin", {
     options = { "Bottom", "Center", "Top" },
     default = { Dropdown = "Bottom" },
 }, function(v)
     ESP.tracerOrigin = v.Dropdown
 end)
 
-BoxPlayerESPOpt.element("Slider", "Max Distance", {
+UI.boxPlayerESPOpt.element("Slider", "Max Distance", {
     default = { min = 100, max = 5000, default = 2000 },
     suffix  = " studs",
 }, function(v)
     ESP.maxDistance = v.Slider
 end)
 
-BoxPlayerESPOpt.element("Slider", "Bar Render Distance", {
+UI.boxPlayerESPOpt.element("Slider", "Bar Render Distance", {
     default = { min = 20, max = 500, default = 150 },
     suffix  = " studs",
 }, function(v)
     ESP.barDistance = v.Slider
 end)
 
-BoxPlayerESPOpt.element("Slider", "Text Size", {
+UI.boxPlayerESPOpt.element("Slider", "Text Size", {
     default = { min = 10, max = 24, default = 14 },
 }, function(v)
     ESP.textSize = v.Slider
 end)
 
-BoxPlayerESPOpt.element("Slider", "Box Thickness", {
+UI.boxPlayerESPOpt.element("Slider", "Box Thickness", {
     default = { min = 1, max = 5, default = 1 },
 }, function(v)
     ESP.boxThickness = v.Slider
 end)
 
-BoxPlayerESPOpt.element("Slider", "Bar Width", {
+UI.boxPlayerESPOpt.element("Slider", "Bar Width", {
     default = { min = 1, max = 10, default = 3 },
 }, function(v)
     ESP.barWidth = v.Slider
 end)
 
-BoxPlayerESPOpt.element("Slider", "Max Cooldowns Shown", {
+UI.boxPlayerESPOpt.element("Slider", "Max Cooldowns Shown", {
     default = { min = 1, max = 8, default = 3 },
 }, function(v)
     ESP.maxCooldowns = v.Slider
 end)
 
-BoxPlayerESPOpt.element("Slider", "Arrow Distance", {
+UI.boxPlayerESPOpt.element("Slider", "Arrow Distance", {
     default = { min = 50, max = 400, default = 150 },
 }, function(v)
     ESP.arrowOffset = v.Slider
 end)
 
-BoxPlayerESPOpt.element("Slider", "Arrow Size", {
+UI.boxPlayerESPOpt.element("Slider", "Arrow Size", {
     default = { min = 5, max = 30, default = 15 },
 }, function(v)
     ESP.arrowSize = v.Slider
@@ -4373,7 +4476,7 @@ yield()
 ---------------------------------------------------------------------
 -- MOB ESP UI
 ---------------------------------------------------------------------
-BoxMobESP.element("Toggle", "Enable Mob ESP", nil, function(v)
+UI.boxMobESP.element("Toggle", "Enable Mob ESP", nil, function(v)
     if v.Toggle and not drawingAvailable() then return end
     MOB.enabled = v.Toggle
     if v.Toggle then
@@ -4386,79 +4489,79 @@ BoxMobESP.element("Toggle", "Enable Mob ESP", nil, function(v)
     notify("Visuals", "Mob ESP " .. (v.Toggle and "enabled" or "disabled"))
 end)
 
-BoxMobESP.create_line()
+UI.boxMobESP.create_line()
 
-BoxMobESP.element("Toggle", "Show Name", ON, function(v)
+UI.boxMobESP.element("Toggle", "Show Name", ON, function(v)
     MOB.showName = v.Toggle
 end, "mob"):add_color({ Color = MOB.nameColor }, false, function(c)
     MOB.nameColor = c.Color
 end)
 
-BoxMobESP.element("Toggle", "Show Distance", ON, function(v)
+UI.boxMobESP.element("Toggle", "Show Distance", ON, function(v)
     MOB.showDistance = v.Toggle
 end, "mob"):add_color({ Color = MOB.distanceColor }, false, function(c)
     MOB.distanceColor = c.Color
 end)
 
-BoxMobESP.element("Toggle", "Show Health Text", ON, function(v)
+UI.boxMobESP.element("Toggle", "Show Health Text", ON, function(v)
     MOB.showHealthText = v.Toggle
 end, "mob")
 
-BoxMobESP.element("Toggle", "Show Health Bar", ON, function(v)
+UI.boxMobESP.element("Toggle", "Show Health Bar", ON, function(v)
     MOB.showHealthBar = v.Toggle
 end, "mob")
 
-BoxMobESP.element("Toggle", "Show Boxes", ON, function(v)
+UI.boxMobESP.element("Toggle", "Show Boxes", ON, function(v)
     MOB.showBoxes = v.Toggle
 end, "mob"):add_color({ Color = MOB.boxColor }, false, function(c)
     MOB.boxColor = c.Color
 end)
 
-BoxMobESP.element("Toggle", "Show Tracers", nil, function(v)
+UI.boxMobESP.element("Toggle", "Show Tracers", nil, function(v)
     MOB.showTracers = v.Toggle
 end, "mob"):add_color({ Color = MOB.tracerColor }, false, function(c)
     MOB.tracerColor = c.Color
 end)
 
-BoxMobESP.element("Toggle", "Show Highlight", nil, function(v)
+UI.boxMobESP.element("Toggle", "Show Highlight", nil, function(v)
     MOB.showHighlight = v.Toggle
 end, "mob"):add_color({ Color = MOB.highlightFill }, false, function(c)
     MOB.highlightFill = c.Color
 end)
 
-BoxMobESPOpt.element("Slider", "Max Distance", {
+UI.boxMobESPOpt.element("Slider", "Max Distance", {
     default = { min = 50, max = 2000, default = 500 },
     suffix  = " studs",
 }, function(v)
     MOB.maxDistance = v.Slider
 end, "mob")
 
-BoxMobESPOpt.element("Slider", "Bar Render Distance", {
+UI.boxMobESPOpt.element("Slider", "Bar Render Distance", {
     default = { min = 20, max = 500, default = 150 },
     suffix  = " studs",
 }, function(v)
     MOB.barDistance = v.Slider
 end, "mob")
 
-BoxMobESPOpt.element("Slider", "Text Size", {
+UI.boxMobESPOpt.element("Slider", "Text Size", {
     default = { min = 10, max = 24, default = 13 },
 }, function(v)
     MOB.textSize = v.Slider
 end, "mob")
 
-BoxMobESPOpt.element("Slider", "Box Thickness", {
+UI.boxMobESPOpt.element("Slider", "Box Thickness", {
     default = { min = 1, max = 5, default = 1 },
 }, function(v)
     MOB.boxThickness = v.Slider
 end, "mob")
 
-BoxMobESPOpt.element("Slider", "Bar Width", {
+UI.boxMobESPOpt.element("Slider", "Bar Width", {
     default = { min = 1, max = 10, default = 3 },
 }, function(v)
     MOB.barWidth = v.Slider
 end, "mob")
 
-BoxMobESPOpt.element("Button", "Rescan Mobs", nil, function()
+UI.boxMobESPOpt.element("Button", "Rescan Mobs", nil, function()
     if not MOB.enabled then
         notify("Visuals", "Enable Mob ESP first")
         return
@@ -4543,18 +4646,18 @@ local function chakraPointNames()
 end
 
 local selectedPoint = nil
-local pointDropdown = BoxChakraPoints.element("Dropdown", "Chakra Point", {
+local pointDropdown = UI.boxChakraPoints.element("Dropdown", "Chakra Point", {
     options = chakraPointNames(),
 }, function(v)
     selectedPoint = v.Dropdown
 end)
 
-BoxChakraPoints.element("Button", "Refresh Points", nil, function()
+UI.boxChakraPoints.element("Button", "Refresh Points", nil, function()
     pointDropdown:refresh(chakraPointNames())
     notify("Teleport", "Chakra points refreshed", 2)
 end)
 
-BoxChakraPoints.element("Button", "Teleport to Chakra Point", nil, function()
+UI.boxChakraPoints.element("Button", "Teleport to Chakra Point", nil, function()
     if not selectedPoint or selectedPoint == "" then
         notify("Teleport", "Select a chakra point first")
         return
@@ -4579,7 +4682,7 @@ BoxChakraPoints.element("Button", "Teleport to Chakra Point", nil, function()
     notify("Teleport", "Point not found - refresh the list")
 end)
 
-BoxChakraPoints.create_line()
+UI.boxChakraPoints.create_line()
 
 ---------------------------------------------------------------------
 -- UNLOCK ALL CHAKRA POINTS
@@ -4592,7 +4695,7 @@ BoxChakraPoints.create_line()
 K.unlockAbort   = false
 K.beingObserved = false
 
-BoxChakraPoints.element("Button", "Unlock All Chakra Points", nil, function()
+UI.boxChakraPoints.element("Button", "Unlock All Chakra Points", nil, function()
     K.unlockAbort = false
 
     task.spawn(function()
@@ -4637,7 +4740,7 @@ BoxChakraPoints.element("Button", "Unlock All Chakra Points", nil, function()
     end)
 end)
 
-BoxChakraPoints.element("Button", "Abort Unlock", nil, function()
+UI.boxChakraPoints.element("Button", "Abort Unlock", nil, function()
     K.unlockAbort = true
     notify("Teleport", "Aborting", 2)
 end)
@@ -4697,17 +4800,17 @@ local function teleportToFruit(fruitName, label)
     end
 end
 
-BoxFruits.element("Button", "Teleport to Life Fruit", nil, function()
+UI.boxFruits.element("Button", "Teleport to Life Fruit", nil, function()
     teleportToFruit("Life Up Fruit", "Life Fruit")
 end)
 
-BoxFruits.element("Button", "Teleport to Chakra Fruit", nil, function()
+UI.boxFruits.element("Button", "Teleport to Chakra Fruit", nil, function()
     teleportToFruit("Chakra Fruit", "Chakra Fruit")
 end)
 
-BoxFruits.create_line()
+UI.boxFruits.create_line()
 
-BoxFruits.element("Button", "Reset Visited Fruits", nil, function()
+UI.boxFruits.element("Button", "Reset Visited Fruits", nil, function()
     visitedFruits = {}
     notify("Teleport", "Visited fruit list cleared", 2)
 end)
@@ -4725,18 +4828,18 @@ local function playerNames()
 end
 
 local selectedTarget = nil
-local playerDropdown = BoxTpPlayer.element("Dropdown", "Player", {
+local playerDropdown = UI.boxTpPlayer.element("Dropdown", "Player", {
     options = playerNames(),
 }, function(v)
     selectedTarget = v.Dropdown
 end)
 
-BoxTpPlayer.element("Button", "Refresh Player List", nil, function()
+UI.boxTpPlayer.element("Button", "Refresh Player List", nil, function()
     playerDropdown:refresh(playerNames())
     notify("Teleport", "Player list refreshed", 2)
 end)
 
-BoxTpPlayer.element("Button", "Teleport to Player", nil, function()
+UI.boxTpPlayer.element("Button", "Teleport to Player", nil, function()
     if not selectedTarget or selectedTarget == "" then
         notify("Teleport", "Select a player first")
         return
@@ -4996,11 +5099,11 @@ local function flatten(value)
     return table.concat(parts, ", ")
 end
 
-BoxViewData.element("Combo", "Data Types", { options = DATA_TYPES }, function(v)
+UI.boxViewData.element("Combo", "Data Types", { options = DATA_TYPES }, function(v)
     selectedData = v.Combo
 end)
 
-BoxViewData.element("Button", "View Data", nil, function()
+UI.boxViewData.element("Button", "View Data", nil, function()
     if #selectedData == 0 then
         notify("Data", "Pick at least one data type")
         return
@@ -5034,7 +5137,7 @@ BoxViewData.element("Button", "View Data", nil, function()
     end)
 end)
 
-BoxViewData.create_line()
+UI.boxViewData.create_line()
 
 ---------------------------------------------------------------------
 -- MISC :: EYE TYPE
@@ -5091,14 +5194,14 @@ local function findEyeName(data, eyeType)
     return nil
 end
 
-BoxViewData.element("Dropdown", "Eye Type", {
+UI.boxViewData.element("Dropdown", "Eye Type", {
     options = { "Mangekyo", "Rinnegan" },
     default = { Dropdown = "Mangekyo" },
 }, function(v)
     selectedEye = v.Dropdown
 end)
 
-BoxViewData.element("Button", "View Eye Type", nil, function()
+UI.boxViewData.element("Button", "View Eye Type", nil, function()
     task.spawn(function()
         local data = getPlayerData()
         if not data then
@@ -5134,16 +5237,16 @@ end)
 local purchaseItem   = ""
 local purchaseAmount = 1
 
-BoxPurchase.element("TextBox", "Item Name", nil, function(v)
+UI.boxPurchase.element("TextBox", "Item Name", nil, function(v)
     purchaseItem = v.Text
 end)
 
-BoxPurchase.element("TextBox", "Amount", { default = "1", maxlen = 6 }, function(v)
+UI.boxPurchase.element("TextBox", "Amount", { default = "1", maxlen = 6 }, function(v)
     local n = tonumber(v.Text)
     purchaseAmount = (n and n >= 1) and math.floor(n) or 1
 end)
 
-BoxPurchase.element("Button", "Purchase Item", nil, function()
+UI.boxPurchase.element("Button", "Purchase Item", nil, function()
     if purchaseItem == "" then
         notify("Purchase", "Enter an item name")
         return
@@ -5164,10 +5267,10 @@ BoxPurchase.element("Button", "Purchase Item", nil, function()
     end)
 end)
 
-BoxPurchase.create_line()
-BoxPurchase.element("Label", "Quick buys")
+UI.boxPurchase.create_line()
+UI.boxPurchase.element("Label", "Quick buys")
 
-BoxPurchase.element("Button", "Buy Ramen (10 Ryo)", nil, function()
+UI.boxPurchase.element("Button", "Buy Ramen (10 Ryo)", nil, function()
     task.spawn(function()
         pcall(function()
             RepStorage:WaitForChild("Events"):WaitForChild("DataFunction"):InvokeServer(
@@ -5179,7 +5282,7 @@ BoxPurchase.element("Button", "Buy Ramen (10 Ryo)", nil, function()
     end)
 end)
 
-BoxPurchase.element("Button", "Buy Accessory (95 Ryo)", nil, function()
+UI.boxPurchase.element("Button", "Buy Accessory (95 Ryo)", nil, function()
     task.spawn(function()
         pcall(function()
             RepStorage:WaitForChild("Events"):WaitForChild("DataFunction"):InvokeServer(
@@ -5196,21 +5299,21 @@ yield(true)
 ---------------------------------------------------------------------
 -- SECURITY :: SAFE TELEPORT UI
 ---------------------------------------------------------------------
-BoxSafeTp.element("Toggle", "Safe Teleport", ON, function(v)
+UI.boxSafeTp.element("Toggle", "Safe Teleport", ON, function(v)
     Safe.enabled = v.Toggle
     notify("Security", "Safe Teleport " .. (v.Toggle and "enabled" or "disabled"))
 end)
 
-BoxSafeTp.element("Slider", "Detection Range", {
+UI.boxSafeTp.element("Slider", "Detection Range", {
     default = { min = 0, max = 500, default = 100 },
     suffix  = " studs",
 }, function(v)
     Safe.detectionRange = v.Slider
 end)
 
-BoxSafeTp.create_line()
+UI.boxSafeTp.create_line()
 
-BoxSafeTp.element("TextBox", "Safespot X, Y, Z", {
+UI.boxSafeTp.element("TextBox", "Safespot X, Y, Z", {
     default = string.format("%.1f, %.1f, %.1f", Safe.safespot.X, Safe.safespot.Y, Safe.safespot.Z),
 }, function(v)
     local nums = {}
@@ -5222,7 +5325,7 @@ BoxSafeTp.element("TextBox", "Safespot X, Y, Z", {
     end
 end)
 
-BoxSafeTp.element("Button", "Set Safespot To Current Position", nil, function()
+UI.boxSafeTp.element("Button", "Set Safespot To Current Position", nil, function()
     local hrp = root()
     if not hrp then
         notify("Security", "No character found")
@@ -5233,13 +5336,13 @@ BoxSafeTp.element("Button", "Set Safespot To Current Position", nil, function()
         Safe.safespot.X, Safe.safespot.Y, Safe.safespot.Z))
 end)
 
-BoxSafeTp.element("Button", "Teleport to Safespot", nil, function()
+UI.boxSafeTp.element("Button", "Teleport to Safespot", nil, function()
     if safeTeleport(CFrame.new(Safe.safespot), true) then
         notify("Security", "Went to safespot")
     end
 end)
 
-BoxSafeTp.element("Button", "Copy Current Position", nil, function()
+UI.boxSafeTp.element("Button", "Copy Current Position", nil, function()
     local hrp = root()
     if not hrp then
         notify("Security", "No character found")
@@ -5530,7 +5633,7 @@ local function senseStop()
     end
 end
 
-BoxDetection.element("Toggle", "Chakra Sense Notifier", nil, function(v)
+UI.boxDetection.element("Toggle", "Chakra Sense Notifier", nil, function(v)
     Sense.enabled = v.Toggle
     if v.Toggle then
         senseStart()
@@ -5541,15 +5644,15 @@ BoxDetection.element("Toggle", "Chakra Sense Notifier", nil, function(v)
     end
 end)
 
-BoxDetection.element("Toggle", "Sense Alert Sound", { default = { Toggle = true } }, function(v)
+UI.boxDetection.element("Toggle", "Sense Alert Sound", { default = { Toggle = true } }, function(v)
     Sense.sound = v.Toggle
 end)
 
-BoxDetection.element("Toggle", "Drag Sense Panel", nil, function(v)
+UI.boxDetection.element("Toggle", "Drag Sense Panel", nil, function(v)
     if Sense.panel then Sense.panel.draggable = v.Toggle end
 end)
 
-BoxDetection.element("Toggle", "Extreme Caution", nil, function(v)
+UI.boxDetection.element("Toggle", "Extreme Caution", nil, function(v)
     Sense.extremeCaution = v.Toggle
 
     if v.Toggle then
@@ -6460,9 +6563,9 @@ local function nearbyPlayers()
     return found
 end
 
-BoxDetection.create_line()
+UI.boxDetection.create_line()
 
-BoxDetection.element("Toggle", "Player Proximity", nil, function(v)
+UI.boxDetection.element("Toggle", "Player Proximity", nil, function(v)
     Prox.enabled = v.Toggle
 
     if v.Toggle then
@@ -6536,11 +6639,11 @@ BoxDetection.element("Toggle", "Player Proximity", nil, function(v)
     end
 end)
 
-BoxDetection.element("Toggle", "Drag Proximity Panel", nil, function(v)
+UI.boxDetection.element("Toggle", "Drag Proximity Panel", nil, function(v)
     if Prox.panel then Prox.panel.draggable = v.Toggle end
 end)
 
-BoxDetection.element("Slider", "Proximity Warn Range", {
+UI.boxDetection.element("Slider", "Proximity Warn Range", {
     default = { min = 0, max = 500, default = 0 },
     suffix  = " studs",
 }, function(v)
@@ -6548,11 +6651,11 @@ BoxDetection.element("Slider", "Proximity Warn Range", {
     Prox.lastWarned = {}
 end)
 
-BoxDetection.element("Toggle", "Proximity: Ignore Village", nil, function(v)
+UI.boxDetection.element("Toggle", "Proximity: Ignore Village", nil, function(v)
     Prox.ignoreVillage = v.Toggle
 end)
 
-BoxDetection.element("TextBox", "Ignore Users (comma sep)", { maxlen = 120 }, function(v)
+UI.boxDetection.element("TextBox", "Ignore Users (comma sep)", { maxlen = 120 }, function(v)
     Prox.ignoreUsers = v.Text
 end)
 
@@ -6564,17 +6667,17 @@ yield(true)
 local configName = "default"
 local configList
 
-BoxConfigs.element("TextBox", "Config Name", { default = "default", maxlen = 32 }, function(v)
+UI.boxConfigs.element("TextBox", "Config Name", { default = "default", maxlen = 32 }, function(v)
     if v.Text ~= "" then configName = v.Text end
 end)
 
-configList = BoxConfigs.element("Dropdown", "Saved Configs", {
+configList = UI.boxConfigs.element("Dropdown", "Saved Configs", {
     options = Window.list_cfgs(),
 }, function(v)
     if v.Dropdown and v.Dropdown ~= "" then configName = v.Dropdown end
 end)
 
-BoxConfigs.element("Button", "Save Config", nil, function()
+UI.boxConfigs.element("Button", "Save Config", nil, function()
     local ok, err = Window.save_cfg(configName)
     if ok then
         configList:refresh(Window.list_cfgs(), true)
@@ -6584,7 +6687,7 @@ BoxConfigs.element("Button", "Save Config", nil, function()
     end
 end)
 
-BoxConfigs.element("Button", "Load Config", nil, function()
+UI.boxConfigs.element("Button", "Load Config", nil, function()
     local ok, err = Window.load_cfg(configName)
     if ok then
         notify("Config", 'Loaded "' .. configName .. '"')
@@ -6593,7 +6696,7 @@ BoxConfigs.element("Button", "Load Config", nil, function()
     end
 end)
 
-BoxConfigs.element("Button", "Delete Config", nil, function()
+UI.boxConfigs.element("Button", "Delete Config", nil, function()
     if Window.delete_cfg(configName) then
         configList:refresh(Window.list_cfgs())
         notify("Config", 'Deleted "' .. configName .. '"')
@@ -6602,7 +6705,7 @@ BoxConfigs.element("Button", "Delete Config", nil, function()
     end
 end)
 
-BoxConfigs.element("Button", "Refresh List", nil, function()
+UI.boxConfigs.element("Button", "Refresh List", nil, function()
     configList:refresh(Window.list_cfgs(), true)
     notify("Config", "Config list refreshed", 2)
 end)
@@ -6610,13 +6713,13 @@ end)
 ---------------------------------------------------------------------
 -- SETTINGS :: MENU
 ---------------------------------------------------------------------
-BoxMenu.element("Label", "Kyo - Private")
-BoxMenu.element("Label", "Toggle menu: Insert")
-BoxMenu.create_line()
+UI.boxMenu.element("Label", "Kyo - Private")
+UI.boxMenu.element("Label", "Toggle menu: Insert")
+UI.boxMenu.create_line()
 
 local MENU_KEYS = { "Insert", "RightShift", "RightControl", "F1", "F2", "F4" }
 
-BoxMenu.element("Dropdown", "Menu Keybind", {
+UI.boxMenu.element("Dropdown", "Menu Keybind", {
     options = MENU_KEYS,
     default = { Dropdown = "Insert" },
 }, function(v)
@@ -6651,6 +6754,7 @@ local function unload()
 
     pcall(setNoclip, false)
     pcall(omniStop)
+    pcall(chargeStop)
     pcall(senseStop)
     pcall(stopMobRegistry)
     pcall(restoreVisuals)
@@ -6712,7 +6816,7 @@ local function unload()
     end)
 end
 
-BoxMenu.element("Button", "Unload Script", nil, function()
+UI.boxMenu.element("Button", "Unload Script", nil, function()
     notify("Kyo", "Unloading...", 2)
     task.delay(0.35, unload)
 end)
