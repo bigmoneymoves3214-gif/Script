@@ -357,7 +357,12 @@ local Atlas = (function()
                 elseif v.Type == "Hold" then
                     v.Active = true
                 end
+                -- Pressed marks a real key press, so a callback can tell it
+                -- apart from the same callback firing when the bind is being
+                -- configured (mode change, set_value, config load).
+                v.Pressed = true
                 slot.cb(v)
+                v.Pressed = false
             end
         end
     end))
@@ -2182,6 +2187,17 @@ UI.boxMovement       = UI.secPlayer.new_sector("Movement", "Left")
 UI.boxProtection     = UI.secPlayer.new_sector("Protection", "Right")
 UI.playerUtil        = UI.secPlayer.new_sector("Utility", "Right")
 
+UI.secCombat         = TabPlayer.new_section("Combat")
+-- UI.parry             = UI.secCombat.new_sector("Auto Parry", "Left")
+-- UI.parryMoves        = UI.secCombat.new_sector("Moves", "Right")
+-- UI.parryTracker      = UI.secCombat.new_sector("Move Tracker", "Left")
+UI.autoM1            = UI.secCombat.new_sector("Hold to M1", "Left")
+
+-- UI.secBuilder        = TabPlayer.new_section("Parry Builder")
+-- UI.builder           = UI.secBuilder.new_sector("Edit Move", "Left")
+-- UI.builderAdd        = UI.secBuilder.new_sector("Custom Move", "Right")
+-- UI.builderInfo       = UI.secBuilder.new_sector("Timing Reference", "Right")
+
 -- Visuals
 UI.secVisPlayers     = TabVisuals.new_section("Players")
 UI.boxPlayerESP      = UI.secVisPlayers.new_sector("Player ESP", "Left")
@@ -2212,6 +2228,7 @@ UI.boxPurchase       = UI.secMiscData.new_sector("Purchase", "Right")
 UI.secFarm           = TabMisc.new_section("Farm")
 UI.mastery           = UI.secFarm.new_sector("Auto Farm Mastery", "Left")
 UI.masteryOpt        = UI.secFarm.new_sector("Options", "Right")
+UI.ramen             = UI.secFarm.new_sector("Ramen Contest", "Left")
 
 UI.secUtility        = TabMisc.new_section("Utility")
 UI.spectate          = UI.secUtility.new_sector("Spectate", "Left")
@@ -2247,6 +2264,7 @@ K.flags = {
     antiVoid         = false,
     noVisualEffects  = false,
     chakraCharge     = false,
+    buffChakra       = false,
 }
 
 local function character()
@@ -2900,6 +2918,152 @@ local function chargeStop()
     end
     Charge.wasPlaying = false
 end
+
+---------------------------------------------------------------------
+-- FORCE RESET
+--
+-- Health = 0 is enough on its own most of the time, but this game drives
+-- health entirely server side, so a local write can be re-synced away. The
+-- ladder covers that: ask nicely, force the state, then tear the rig apart.
+-- Each step only runs if the one before it did not take.
+---------------------------------------------------------------------
+UI.playerUtil.element("Button", "Force Reset", nil, function()
+    task.spawn(function()
+        local char = character()
+        local hum  = char and char:FindFirstChildOfClass("Humanoid")
+        if not hum then
+            notify("Player", "No character", 3)
+            return
+        end
+
+        pcall(function() hum.Health = 0 end)
+        task.wait(0.3)
+
+        if LP.Character ~= char then return end
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Dead) end)
+        task.wait(0.3)
+
+        if LP.Character == char then
+            pcall(function() char:BreakJoints() end)
+        end
+    end)
+end)
+
+---------------------------------------------------------------------
+-- KICK ON KEY PRESS
+--
+-- A panic key: disconnects you instantly. Client-side Kick needs no server
+-- co-operation, so it is the fastest way out of a server - faster than a
+-- teleport, which has to round trip.
+---------------------------------------------------------------------
+do
+    local armed = false
+
+    local toggle = UI.playerUtil.element("Toggle", "Kick on Key Press", nil, function(v)
+        armed = v.Toggle
+        notify("Player", v.Toggle
+            and "Kick on Key Press armed - bind a key on the right"
+            or  "Kick on Key Press disarmed", 4)
+    end)
+
+    toggle:add_keybind(nil, function(v)
+        -- Only a genuine press. Without this the kick would also fire while
+        -- you are binding the key or when a config loads.
+        if not v.Pressed then return end
+        if not armed or not v.Key then return end
+
+        pcall(function() LP:Kick("[Key Pressed]") end)
+    end)
+end
+
+---------------------------------------------------------------------
+-- BUFF CHAKRA REGEN
+--
+-- Backpack.chakra is a plain NumberValue the server drives. Every time it
+-- ticks UPWARD (a regen tick), this immediately claims a little more on top
+-- by firing DataEvent "TakeChakra" with a NEGATIVE amount - the same event
+-- the game uses to spend chakra, so a negative spend is a gain - and mirrors
+-- the result locally so the HUD agrees.
+--
+-- Only reacts to increases. A decrease is you spending chakra, and re-adding
+-- there would fight the game's own bookkeeping; that branch just re-baselines.
+--
+-- The 0.9s cooldown matches the game's regen tick: firing more often than it
+-- regenerates is what turns this from "a bit more chakra" into a stream of
+-- events with nothing behind them.
+---------------------------------------------------------------------
+local Chakra = { amount = 3, conn = nil, respawnConn = nil }
+
+local function chakraStop()
+    unbind(Chakra.conn)
+    Chakra.conn = nil
+end
+
+local function chakraAttach()
+    chakraStop()
+
+    local backpack = LP:FindFirstChildOfClass("Backpack")
+    local chakra   = backpack and backpack:FindFirstChild("chakra")
+    local maxChakra = backpack and backpack:FindFirstChild("maxChakra")
+    if not chakra then return end
+
+    local baseline = chakra.Value
+    local cooling  = false
+
+    Chakra.conn = bind(chakra.Changed:Connect(function(newValue)
+        if not K.flags.buffChakra then return end
+
+        if newValue <= baseline then
+            -- Spending, or the server correcting us downward.
+            baseline = newValue
+            return
+        end
+
+        if cooling then return end
+        cooling = true
+
+        local target = chakra.Value + Chakra.amount
+        if not maxChakra or target < maxChakra.Value then
+            pcall(function()
+                RepStorage:WaitForChild("Events"):WaitForChild("DataEvent")
+                    :FireServer("TakeChakra", -Chakra.amount)
+            end)
+            chakra.Value = chakra.Value + Chakra.amount
+        end
+
+        baseline = newValue
+        task.wait(0.9)
+        cooling = false
+    end))
+end
+
+UI.playerUtil.element("Toggle", "Buff Chakra Regen", nil, function(v)
+    K.flags.buffChakra = v.Toggle
+
+    if v.Toggle then
+        chakraAttach()
+
+        -- The Backpack and its chakra value are rebuilt on respawn.
+        if not Chakra.respawnConn then
+            Chakra.respawnConn = bind(LP.CharacterAdded:Connect(function()
+                if not K.flags.buffChakra then return end
+                task.wait(1.3)
+                if K.flags.buffChakra then chakraAttach() end
+            end))
+        end
+
+        notify("Player", "Buff Chakra Regen enabled")
+    else
+        chakraStop()
+        notify("Player", "Buff Chakra Regen disabled")
+    end
+end)
+
+UI.playerUtil.element("Slider", "Chakra Bonus", {
+    default = { min = 1, max = 6, default = 3 },
+}, function(v)
+    Chakra.amount = v.Slider
+end)
 
 UI.playerUtil.element("Toggle", "Infinite Chakra Charge", nil, function(v)
     K.flags.chakraCharge = v.Toggle
@@ -5225,6 +5389,11 @@ yield()
 -- poll. Table values are flattened to a single line so a stat with sub-keys
 -- (UsedSkills, quest tables) still fits a notification.
 ---------------------------------------------------------------------
+-- Scoped: every local in here is only reached through the callbacks
+-- defined alongside it, which keep it alive as an upvalue. Closing the
+-- block frees the register slots - the main chunk is at Lua's 200-local
+-- ceiling and this section is the cheapest thing to give back.
+do
 local DATA_TYPES = {
     "M1s", "Blocks", "Knocks", "BloodExplosions", "IndraAshuraAgeUps", "Grips",
     "PB", "UsedSkills", "WoodXP", "WaterXP", "EarthXP", "WindXP",
@@ -5459,6 +5628,8 @@ UI.boxPurchase.element("Button", "Buy Accessory (95 Ryo)", nil, function()
         notify("Purchase", "Accessory requested - only works once per age up", 5)
     end)
 end)
+
+end
 
 yield(true)
 
@@ -5884,6 +6055,16 @@ local AWAKEN_MODES = {
     "Matatabi Cloak", "Shukaku Cloak", "Isobu Cloak",
 }
 
+-- The mastery farm parks at one of the BACKUP safespots rather than the main
+-- one. The main spot is where every other teleport in the script lands, so
+-- sitting there on a respawn loop is the most visible thing you can do; these
+-- three are off the beaten path and get picked by whichever is empty.
+local MASTERY_SAFESPOTS = {
+    CFrame.new(-2678.399414, 949.681030, -2065.443115) * CFrame.Angles(0, -0.041036, 0),
+    CFrame.new(-3488.499756, 436.322540, -5240.671875) * CFrame.Angles(0, -1.572860, 0),
+    CFrame.new(1692.969971, 200.596710, 1404.145996)  * CFrame.Angles(0, -0.019851, 0),
+}
+
 local Mastery = {
     enabled     = false,
     input       = "",
@@ -5891,7 +6072,18 @@ local Mastery = {
     thread      = nil,
     respawnConn = nil,
     toggle      = nil,
+    spot        = nil,   -- chosen once per cycle, not per frame
 }
+
+-- First backup with nobody near it; falls back to the first if all are busy.
+local function masterySafespot()
+    for _, cf in ipairs(MASTERY_SAFESPOTS) do
+        if #playersNear(cf.Position, Safe.detectionRange) == 0 then
+            return cf
+        end
+    end
+    return MASTERY_SAFESPOTS[1]
+end
 
 local function isAwakenMode(name)
     return table.find(AWAKEN_MODES, name) ~= nil
@@ -5942,17 +6134,31 @@ local function masterySkills()
     return list
 end
 
--- Block here for as long as somebody is watching with chakra sense.
-local function masteryWaitClear()
-    while K.beingObserved and Mastery.enabled do
-        task.wait(0.5)
+-- Chakra sense means somebody is actively looking at you. Pausing and
+-- resuming in place just means they watch you stand still and then start
+-- again; the farm shuts itself off instead and tells you why.
+local function masteryCheckClear()
+    if not Mastery.enabled then return false end
+
+    if K.beingObserved then
+        masteryStop()
+        if Mastery.toggle then
+            Mastery.toggle:set_value({ Toggle = false }, true)
+        end
+        notify("Farm", "Chakra sense detected - mastery farm stopped", 6)
+        return false
     end
-    return Mastery.enabled
+
+    return true
 end
 
 local function masteryAwakenCycle(mode)
     task.wait(0.1)
-    if not masteryWaitClear() then return end
+    if not masteryCheckClear() then return end
+
+    -- Pick the spot once per cycle: re-evaluating every frame would make us
+    -- hop between spots while the forcefield burns down.
+    Mastery.spot = masterySafespot()
 
     local char = character() or LP.CharacterAdded:Wait()
     local hrp  = char and char:WaitForChild("HumanoidRootPart", 10)
@@ -5962,13 +6168,13 @@ local function masteryAwakenCycle(mode)
     -- at the safespot; with it off we just wait where we are.
     repeat
         task.wait()
-        if not masteryWaitClear() then return end
+        if not masteryCheckClear() then return end
         if not Mastery.noReset then
-            pcall(function() safeTeleport(CFrame.new(Safe.safespot), true) end)
+            pcall(function() safeTeleport(Mastery.spot or masterySafespot(), true) end)
         end
     until not char:FindFirstChild("ForceField") or char.Parent == nil or not Mastery.enabled
 
-    if not masteryWaitClear() then return end
+    if not masteryCheckClear() then return end
     if not (char and char.Parent and hrp and hrp.Parent) then return end
 
     pcall(function()
@@ -6017,7 +6223,7 @@ local function masteryStart()
         local index = 1
 
         while Mastery.enabled do
-            if not masteryWaitClear() then break end
+            if not masteryCheckClear() then break end
 
             local skill = skills[index]
 
@@ -6065,11 +6271,1331 @@ UI.masteryOpt.element("Toggle", "Don't Reset", nil, function(v)
         or  "Reset on - will safespot and force respawn", 4)
 end)
 
-UI.masteryOpt.create_line()
-UI.masteryOpt.element("Label", "Awaken modes normally reset you")
-UI.masteryOpt.element("Label", "to re-enter the mode. Don't Reset")
-UI.masteryOpt.element("Label", "keeps you put and skips that.")
-UI.masteryOpt.element("Label", "Regular skills never reset either way.")
+
+yield(true)
+-- ===================================================================
+-- AUTO PARRY - DISABLED
+--
+-- Commented out on request. Everything below is intact: uncomment the
+-- block (and the UI.parry* / UI.secBuilder sectors in the layout, and
+-- the Parry lines in unload) to bring it back.
+-- ===================================================================
+--[==[
+
+---------------------------------------------------------------------
+-- AUTO PARRY
+--
+-- Rewritten against the game's own block code rather than a guess at it.
+--
+-- WHY THE OLD ONE MISBEHAVED
+--
+-- It decided whether it could parry with a hand-rolled check (stunned, a
+-- CurrentSkill, a couple of animation ids) and then just invoked "Block".
+-- The game's real gate is attemptBlock() and it is much stricter:
+--
+--     u32.Occupied == false and u32.BlockCooldown == false
+--     and u32.ShortCooldown == false and u32.BlockStartCooldown == false
+--     and Settings.Stunned.Value == false and u32.Knocked == false
+--     and not character:FindFirstChild("ForceField")
+--     and not character:GetAttribute("KotoamatsukamiAttacking")
+--     and not character:GetAttribute("KotoamatsukamiForceMove")
+--
+-- Three of those live only in the client's state table (u32) and are
+-- invisible from outside it - which is exactly why the old version blocked
+-- during states where blocking is impossible, and why it sometimes silently
+-- did nothing: the server refused a Block the client should never have sent.
+--
+-- It also never did what attemptBlock does around the invoke - set
+-- Settings.Blocking, take Occupied, drop WalkSpeed to 5 and JumpPower to 0,
+-- and roll all of it back if the server says no. Without that the client
+-- never enters its blocking state even when the server accepts.
+--
+-- This version resolves u32 out of canM1's upvalues (same route as
+-- performM1) and mirrors attemptBlock exactly, including the rollback.
+--
+-- TIMING
+--
+-- From the game's settings table:
+--     PerfectBlockWindow   = 0.25   -- how long a block counts as a parry
+--     PerfectBlockCooldown = 0.6
+--     BlockCooldown        = 0.5    -- after EndBlock
+--     MeleeStunTime        = 0.6
+--
+-- So a parry lands if the hit arrives within 0.25s of the block starting.
+-- Aiming for the middle of that window (0.125s before impact) leaves the most
+-- slack either side. Auto Delay subtracts one-way ping from each move's
+-- configured delay so the block ARRIVES on time rather than being SENT on
+-- time - which is the whole difference on a 150ms connection.
+---------------------------------------------------------------------
+local PB_WINDOW   = 0.25
+local PB_COOLDOWN = 0.6
+local BLOCK_CD    = 0.5
+
+local Parry = {
+    enabled     = false,
+    blatant     = false,   -- default OFF now: the real gate is worth using
+    autoDelay   = true,
+    customDelay = 0,
+    cooldown    = 0.3,
+    lastParry   = 0,
+    conns       = {},
+    dataFn      = nil,
+    state       = nil,     -- u32, when we can reach it
+    lastPing    = 0.05,
+    parryBreaks = false,   -- see Parry.block
+}
+
+-- Generated from the game's own data tables in gamescript2:
+--   u20.Animations  animation name -> asset id
+--   u20.Skills      StartUpAnim, LoadUpTime, OccupiedTime, BlockBreaks
+--   u20.NPC         every NPC attack, each with a Blockable flag
+--
+-- delay comes from LoadUpTime (player skills) or the windup wait in the NPC
+-- attack dispatcher, so it is the game's own number rather than a guess.
+-- `breaks = true` marks BlockBreaks skills - see Parry.block.
+--
+-- Most are off by default: 150 moves all firing would block constantly.
+Parry.moves = {
+    { name = "Smoldering Earth", type = "workspace", id = "Branch", detect = 60, range = 30, delay = 0, block = 0.5, on = true },
+    { name = "Fireball", type = "debris", id = "Fireball", detect = 80, range = 25, delay = 0, block = 0.2, on = true },
+    { name = "Water Wave", type = "workspace", id = "Water Wave", detect = 200, range = 30, delay = 0, block = 0.2, on = true },
+    { name = "Water Dragon", type = "workspace", id = "WaterDragonHead", detect = 200, range = 25, delay = 0, block = 0.6, on = true },
+    { name = "Earth Dragon", type = "debris", id = "Earth Dragon", detect = 80, range = 30, delay = 0, block = 0.5, on = true },
+    { name = "128 Palms", type = "animation", id = "8699113073", detect = 150, range = 60, delay = 0.0, block = 0.7, on = false },
+    { name = "64 Palms", type = "animation", id = "8699113073", detect = 150, range = 60, delay = 0.0, block = 0.7, on = false },
+    { name = "Almighty Push", type = "animation", id = "10930376912", breaks = true, detect = 150, range = 60, delay = 0.4, block = 0.9, on = true },
+    { name = "Asumai One Two", type = "animation", id = "99624902543164", breaks = true, detect = 80, range = 25, delay = 0.0, block = 0.5, on = false },
+    { name = "Barbarian Summoning", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Barbarit Summoning", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Beast Extraction", type = "animation", id = "9916542210", detect = 150, range = 60, delay = 0.0, block = 3.0, on = false },
+    { name = "Binding Seal", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Blinding Strike", type = "animation", id = "8214031055", breaks = true, detect = 80, range = 25, delay = 0.3, block = 0.6, on = false },
+    { name = "Blood Arrow", type = "animation", id = "83093666885184", detect = 150, range = 60, delay = 0.45, block = 0.55, on = false },
+    { name = "Blood Dragon", type = "animation", id = "7250960114", breaks = true, detect = 150, range = 60, delay = 0.0, block = 1.0, on = false },
+    { name = "Bone Manipulation", type = "animation", id = "92287834952226", detect = 150, range = 60, delay = 0.0, block = 3.0, on = false },
+    { name = "Bowl Summoning", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Bugs Strike", type = "animation", id = "11204330767", detect = 150, range = 60, delay = 0.4, block = 0.8, on = false },
+    { name = "Bugs Swarm", type = "animation", id = "8789227433", detect = 150, range = 60, delay = 0.3, block = 0.5, on = false },
+    { name = "Butterfly Flight", type = "animation", id = "11273119075", detect = 150, range = 60, delay = 0.0, block = 3.0, on = false },
+    { name = "Butterfly Slam", type = "animation", id = "11289531561", breaks = true, detect = 150, range = 60, delay = 0.0, block = 0.65, on = false },
+    { name = "Chain Pull", type = "animation", id = "10069265035", detect = 150, range = 60, delay = 0.33, block = 0.5, on = false },
+    { name = "Chains Of The Wild", type = "animation", id = "8789227433", breaks = true, detect = 150, range = 60, delay = 0.3, block = 1.1, on = false },
+    { name = "Chakra Arrow Barrage", type = "animation", id = "83947150304006", detect = 80, range = 25, delay = 0.0, block = 1.8, on = false },
+    { name = "Chakra Exchange", type = "animation", id = "11207371709", detect = 150, range = 60, delay = 0.3, block = 1.0, on = false },
+    { name = "Chakra Infused Slam", type = "animation", id = "10075486924", breaks = true, detect = 80, range = 25, delay = 0.0, block = 0.8, on = false },
+    { name = "Chakra Pellet", type = "animation", id = "7256553550", detect = 150, range = 60, delay = 0.0, block = 0.5, on = false },
+    { name = "Chakra Ressurection", type = "animation", id = "9763847329", detect = 150, range = 60, delay = 0.0, block = 0.2, on = false },
+    { name = "Chakra Sense", type = "animation", id = "9864206537", detect = 150, range = 60, delay = 0.0, block = 3.0, on = false },
+    { name = "Chakra Zone", type = "animation", id = "9885247576", detect = 150, range = 60, delay = 0.0, block = 3.0, on = false },
+    { name = "Charged Ram", type = "animation", id = "5571412330", detect = 80, range = 25, delay = 0.0, block = 3.0, on = false },
+    { name = "Cleave Rush", type = "animation", id = "74933021051396", detect = 150, range = 60, delay = 0.0, block = 0.5, on = false },
+    { name = "Clone Throw", type = "animation", id = "9284920294", breaks = true, detect = 150, range = 60, delay = 0.0, block = 0.4, on = false },
+    { name = "Coral Emerge", type = "animation", id = "99068559501337", breaks = true, detect = 150, range = 60, delay = 0.4, block = 0.5, on = false },
+    { name = "Cratos Summoning", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Deep Forest Emergence", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.4, on = false },
+    { name = "Demonic Ice Mirrors", type = "animation", id = "7198878301", detect = 150, range = 60, delay = 0.0, block = 0.75, on = false },
+    { name = "Dragonic Flames", type = "animation", id = "6914805919", detect = 150, range = 60, delay = 0.0, block = 3.0, on = false },
+    { name = "Drilling Bones", type = "animation", id = "8580099842", detect = 150, range = 60, delay = 0.5, block = 2.5, on = false },
+    { name = "Dynamic Entry", type = "animation", id = "9456787558", breaks = true, detect = 150, range = 60, delay = 0.0, block = 0.9, on = true },
+    { name = "Earth Golem", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Earth Slam", type = "animation", id = "11289531561", breaks = true, detect = 150, range = 60, delay = 0.0, block = 0.8, on = true },
+    { name = "Earth Wall", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Explosive Rotation", type = "animation", id = "8580099842", detect = 150, range = 60, delay = 0.5, block = 2.25, on = false },
+    { name = "Extraction Seal", type = "animation", id = "9916542210", detect = 150, range = 60, delay = 0.0, block = 3.0, on = false },
+    { name = "Feather Genjutsu", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Fern Dance", type = "animation", id = "7198878301", breaks = true, detect = 150, range = 60, delay = 0.0, block = 0.5, on = false },
+    { name = "Fire Seal", type = "animation", id = "7182797024", breaks = true, detect = 150, range = 60, delay = 0.0, block = 3.0, on = false },
+    { name = "Flame Company", type = "animation", id = "8201236844", detect = 150, range = 60, delay = 0.0, block = 1.0, on = false },
+    { name = "Fog Illusion", type = "animation", id = "8201236844", detect = 150, range = 60, delay = 0.0, block = 0.75, on = false },
+    { name = "Fruit Summoning", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Gale Palm", type = "animation", id = "7293816408", breaks = true, detect = 150, range = 60, delay = 0.0, block = 0.9, on = false },
+    { name = "Genjutsu Release", type = "animation", id = "73464540236149", detect = 150, range = 60, delay = 0.0, block = 1.7, on = false },
+    { name = "Healing Bond", type = "animation", id = "7862279706", detect = 150, range = 60, delay = 0.0, block = 1.5, on = false },
+    { name = "Healing Zone", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Hinata\\'s Byakugan", type = "animation", id = "7250960114", detect = 150, range = 60, delay = 0.0, block = 1.0, on = false },
+    { name = "Hirudora Projectile", type = "animation", id = "83093666885184", detect = 150, range = 60, delay = 0.45, block = 0.6, on = false },
+    { name = "Hyper Roar", type = "animation", id = "8789227433", detect = 150, range = 60, delay = 0.0, block = 0.2, on = false },
+    { name = "Ice Dragon", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Ice Floor", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Ice Mirror", type = "animation", id = "7250960114", detect = 150, range = 60, delay = 0.0, block = 0.5, on = false },
+    { name = "Ice Rain", type = "animation", id = "17685181678", detect = 150, range = 60, delay = 0.0, block = 0.2, on = false },
+    { name = "Ice Spikes", type = "animation", id = "7198878301", breaks = true, detect = 150, range = 60, delay = 0.0, block = 0.5, on = false },
+    { name = "Improved Barrage", type = "animation", id = "9840792947", detect = 150, range = 60, delay = 0.0, block = 2.7, on = false },
+    { name = "Injury Heal", type = "animation", id = "8201236844", detect = 150, range = 60, delay = 0.0, block = 1.0, on = false },
+    { name = "Isobu Cloak Bomb", type = "animation", id = "93839342012083", detect = 150, range = 60, delay = 0.0, block = 1.75, on = false },
+    { name = "Jinchuriki Bomb", type = "animation", id = "99832737981724", detect = 150, range = 60, delay = 0.0, block = 1.75, on = false },
+    { name = "Jinchuriki Grab", type = "animation", id = "123629309287395", detect = 150, range = 60, delay = 0.4, block = 1.2, on = false },
+    { name = "Kamui Self-Warp", type = "animation", id = "7286352048", detect = 150, range = 60, delay = 0.3, block = 2.4, on = false },
+    { name = "Kamui Suck", type = "animation", id = "7286352048", detect = 150, range = 60, delay = 0.3, block = 2.65, on = false },
+    { name = "Kotoamatsukami Betray", type = "animation", id = "7286352048", detect = 150, range = 60, delay = 0.0, block = 0.5, on = false },
+    { name = "Kotoamatsukami Defend", type = "animation", id = "7286352048", detect = 150, range = 60, delay = 0.0, block = 0.5, on = false },
+    { name = "Kotoamatsukami Explode", type = "animation", id = "7286352048", detect = 150, range = 60, delay = 0.0, block = 0.5, on = false },
+    { name = "Kunai Throw", type = "animation", id = "7256537857", detect = 80, range = 25, delay = 0.0, block = 0.6, on = false },
+    { name = "Lightning Leap", type = "animation", id = "86213040968703", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Lightning Ripple", type = "animation", id = "7198878301", breaks = true, detect = 150, range = 60, delay = 0.0, block = 1.4, on = false },
+    { name = "Lightning Stream", type = "animation", id = "7193783109", detect = 150, range = 60, delay = 0.0, block = 3.0, on = false },
+    { name = "Lightning Strike", type = "animation", id = "17685181678", breaks = true, detect = 150, range = 60, delay = 0.8, block = 1.0, on = false },
+    { name = "Limb Blossom", type = "animation", id = "8201236844", detect = 150, range = 60, delay = 0.0, block = 1.0, on = false },
+    { name = "Lion\\'s Barrage", type = "animation", id = "9840792947", detect = 150, range = 60, delay = 0.0, block = 1.7, on = false },
+    { name = "Matatabi Cloak Bomb", type = "animation", id = "93839342012083", detect = 150, range = 60, delay = 0.0, block = 1.75, on = false },
+    { name = "Multi Kunai Throw", type = "animation", id = "7256537857", detect = 80, range = 25, delay = 0.0, block = 0.6, on = false },
+    { name = "Night Guy", type = "animation", id = "7293816408", detect = 150, range = 60, delay = 0.0, block = 0.75, on = false },
+    { name = "Overhead Spin", type = "animation", id = "7300582359", detect = 150, range = 60, delay = 0.0, block = 2.5, on = false },
+    { name = "Palm Rotation", type = "animation", id = "8580099842", detect = 150, range = 60, delay = 0.5, block = 3.0, on = false },
+    { name = "Pentadummy Summoning", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Phoenix Flower", type = "animation", id = "6914805919", detect = 150, range = 60, delay = 0.0, block = 0.7, on = false },
+    { name = "Piercing Chakra Arrow", type = "animation", id = "125900382257409", breaks = true, detect = 80, range = 25, delay = 0.0, block = 0.3, on = false },
+    { name = "Pool Expansion", type = "animation", id = "7189207090", breaks = true, detect = 150, range = 60, delay = 0.0, block = 0.8, on = false },
+    { name = "Primary Lotus", type = "animation", id = "11269833515", detect = 150, range = 60, delay = 0.0, block = 1.5, on = false },
+    { name = "Protruding Chains", type = "animation", id = "7193783109", breaks = true, detect = 150, range = 60, delay = 0.3, block = 1.2, on = false },
+    { name = "Purple Susanoo Grab", type = "animation", id = "7286352048", breaks = true, detect = 150, range = 60, delay = 0.3, block = 0.5, on = false },
+    { name = "Rasengan Barrage", type = "animation", id = "8211263620", breaks = true, detect = 150, range = 60, delay = 0.0, block = 3.0, on = false },
+    { name = "Rasenshuriken Projectile", type = "animation", id = "6914805919", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Revival Healing", type = "animation", id = "7255491372", detect = 150, range = 60, delay = 0.0, block = 3.0, on = false },
+    { name = "Rising Wind", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Sasuke Portal", type = "animation", id = "7286352048", detect = 150, range = 60, delay = 0.0, block = 1.0, on = false },
+    { name = "Scrambled Mind", type = "animation", id = "6914805919", detect = 150, range = 60, delay = 0.0, block = 1.5, on = false },
+    { name = "Sealing Banners", type = "animation", id = "7298826950", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Sealing Barrier Rod", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Sealing Floor", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Self Injury Heal", type = "animation", id = "8201236844", detect = 150, range = 60, delay = 0.0, block = 1.0, on = false },
+    { name = "Self Purification", type = "animation", id = "7862279706", detect = 150, range = 60, delay = 0.0, block = 1.8, on = false },
+    { name = "Shisui Susanoo Summon", type = "animation", id = "7286352048", detect = 150, range = 60, delay = 0.0, block = 0.5, on = false },
+    { name = "Shisui Throw Drill", type = "animation", id = "7250960114", detect = 150, range = 60, delay = 0.0, block = 1.0, on = false },
+    { name = "Shukaku Cloak Arm Emerge", type = "animation", id = "6894770447", breaks = true, detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Shukaku Cloak Bomb", type = "animation", id = "93839342012083", detect = 150, range = 60, delay = 0.0, block = 1.75, on = false },
+    { name = "Shukaku Cloak Storm", type = "animation", id = "7198878301", detect = 150, range = 60, delay = 0.0, block = 0.75, on = false },
+    { name = "Spinning Dash", type = "animation", id = "114640618929317", breaks = true, detect = 80, range = 25, delay = 0.0, block = 0.6, on = false },
+    { name = "Spinning Glide", type = "animation", id = "10075589617", detect = 150, range = 60, delay = 0.0, block = 3.0, on = false },
+    { name = "Spinning Human Boulder", type = "animation", id = "129108611364528", detect = 150, range = 60, delay = 0.4, block = 3.0, on = false },
+    { name = "Susanoo Pose", type = "animation", id = "8896884566", breaks = true, detect = 150, range = 60, delay = 0.0, block = 2.5, on = false },
+    { name = "Thrusting Strike", type = "animation", id = "10560758096", breaks = true, detect = 80, range = 25, delay = 0.5, block = 0.9, on = true },
+    { name = "Triple Blood Dragons", type = "animation", id = "7250960114", breaks = true, detect = 150, range = 60, delay = 0.0, block = 1.0, on = false },
+    { name = "Triple Slash", type = "animation", id = "104320328423578", detect = 80, range = 25, delay = 0.2, block = 1.05, on = false },
+    { name = "Twin Blood Dragons", type = "animation", id = "7250960114", breaks = true, detect = 150, range = 60, delay = 0.0, block = 1.0, on = false },
+    { name = "Twin Flame Dragons", type = "animation", id = "9849419108", breaks = true, detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Twin Lions Barrage", type = "animation", id = "8699113073", detect = 150, range = 60, delay = 0.0, block = 2.1, on = false },
+    { name = "Twin Strike", type = "animation", id = "10014972099", breaks = true, detect = 80, range = 25, delay = 0.0, block = 0.72, on = false },
+    { name = "Universal Pull", type = "animation", id = "11159585258", detect = 150, range = 60, delay = 0.4, block = 0.8, on = true },
+    { name = "Vacuum Rotation", type = "animation", id = "8580099842", detect = 150, range = 60, delay = 0.5, block = 3.0, on = false },
+    { name = "Vertical Slash", type = "animation", id = "7282630228", detect = 80, range = 25, delay = 0.1, block = 0.9, on = false },
+    { name = "Water Fountain", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Water Pool", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Water Prison", type = "animation", id = "7182797024", breaks = true, detect = 150, range = 60, delay = 0.0, block = 3.0, on = false },
+    { name = "Wind Discs", type = "animation", id = "6914805919", detect = 150, range = 60, delay = 0.0, block = 1.7, on = false },
+    { name = "Wind Tornado", type = "animation", id = "7182797024", breaks = true, detect = 150, range = 60, delay = 0.0, block = 3.0, on = false },
+    { name = "Wired Kunai", type = "animation", id = "9937511106", detect = 80, range = 25, delay = 0.0, block = 0.3, on = false },
+    { name = "Wood Seal", type = "animation", id = "7182797024", detect = 150, range = 60, delay = 0.0, block = 3.0, on = false },
+    { name = "Wood Suppression", type = "animation", id = "7182797024", breaks = true, detect = 150, range = 60, delay = 0.0, block = 3.0, on = false },
+    { name = "Wooden Roots", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Wooden Spire", type = "animation", id = "6894770447", detect = 150, range = 60, delay = 0.0, block = 0.6, on = false },
+    { name = "Yin Seal", type = "animation", id = "7193783109", detect = 150, range = 60, delay = 0.0, block = 3.0, on = false },
+    { name = "Barbarit The Enchanted - Club Spin", type = "npc", id = "9656290960", npc = "Barbarit The Enchanted", detect = 180, range = 20, delay = 0.6, block = 0.92, on = true },
+    { name = "Barbarit The Enchanted - Kamui Club Slam", type = "npc", id = "9985568656", npc = "Barbarit The Enchanted", detect = 180, range = 30, delay = 0.7, block = 0.4, on = true },
+    { name = "Barbarit The Hallowed - Club Spin", type = "npc", id = "9656290960", npc = "Barbarit The Hallowed", detect = 180, range = 20, delay = 0.6, block = 0.92, on = true },
+    { name = "Barbarit The Hallowed - Kamui Club Slam", type = "npc", id = "9985568656", npc = "Barbarit The Hallowed", detect = 180, range = 30, delay = 0.7, block = 0.4, on = true },
+    { name = "Barbarit The Rose - Club Spin", type = "npc", id = "9656290960", npc = "Barbarit The Rose", detect = 180, range = 20, delay = 0.6, block = 0.92, on = true },
+    { name = "Barbarit The Rose - Kamui Club Slam", type = "npc", id = "9985568656", npc = "Barbarit The Rose", detect = 180, range = 30, delay = 0.7, block = 0.4, on = true },
+    { name = "Clay Runner - Lava Ground Pound", type = "npc", id = "6038040720", npc = "Clay Runner", detect = 150, range = 28, delay = 0.1, block = 1.4, on = true },
+    { name = "Frosted The Rose - Club Spin", type = "npc", id = "9656290960", npc = "Frosted The Rose", detect = 180, range = 20, delay = 0.6, block = 0.92, on = true },
+    { name = "Frosted The Rose - Kamui Club Slam", type = "npc", id = "9985568656", npc = "Frosted The Rose", detect = 180, range = 30, delay = 0.7, block = 0.4, on = true },
+    { name = "Hallowed Lavarossa - Lava Ground Pound", type = "npc", id = "6038040720", npc = "Hallowed Lavarossa", detect = 150, range = 28, delay = 0.1, block = 1.4, on = true },
+    { name = "Lava Snake - Snake Spit", type = "npc", id = "9954909571", npc = "Lava Snake", detect = 250, range = 23, delay = 0.55, block = 1.6, on = true },
+    { name = "The Barbarian - Petrifying Roar", type = "npc", id = "6070787172", npc = "The Barbarian", detect = 150, range = 28, delay = 0.3, block = 0.4, on = true },
+    { name = "The Enchanted Barbarian - Petrifying Roar", type = "npc", id = "6070787172", npc = "The Enchanted Barbarian", detect = 150, range = 28, delay = 0.3, block = 0.4, on = true },
+    { name = "The Frosted Barbarian - Petrifying Roar", type = "npc", id = "6070787172", npc = "The Frosted Barbarian", detect = 150, range = 28, delay = 0.3, block = 0.4, on = true },
+    { name = "The Hallowed Barbarian - Petrifying Roar", type = "npc", id = "6070787172", npc = "The Hallowed Barbarian", detect = 150, range = 28, delay = 0.3, block = 0.4, on = true },
+    { name = "The Ringed Samurai - Club Spin", type = "npc", id = "9656290960", npc = "The Ringed Samurai", detect = 200, range = 20, delay = 0.6, block = 0.92, on = true },
+    -- Matatabi and the bosses the Blockable table does not cover. Carried over
+    -- from the original list, enabled by default like the rest of the NPC set.
+    { name = "Beast Roar", type = "beast", id = "98245450702485", detect = 150, range = 50, delay = 0.1, block = 3, on = true },
+    { name = "Beast Bullet", type = "beast", id = "96448190421657", detect = 150, range = 90, delay = 0.4, block = 0.4, on = true },
+    { name = "Beast R Punch", type = "beast", id = "86414508786370", detect = 150, range = 35, delay = 0.2, block = 0.5, on = true },
+    { name = "Beast Bite", type = "beast", id = "113419524303689", detect = 150, range = 50, delay = 0.2, block = 0.4, on = true },
+    { name = "Beast Tail Swipe", type = "beast", id = "120703747916516", detect = 150, range = 50, delay = 0.1, block = 0.4, on = true },
+    { name = "Beast L Punch", type = "beast", id = "93012373755384", detect = 150, range = 50, delay = 0.4, block = 0.5, on = true },
+    { name = "Manda - Swipe", type = "npc", npc = "Manda", id = "9954860601", detect = 150, range = 30, delay = 0.3, block = 0.4, on = true },
+    { name = "Manda - 360 Swipe", type = "npc", npc = "Manda", id = "9955456879", detect = 150, range = 30, delay = 0.1, block = 0.4, on = true },
+    { name = "Lavarossa - R Punch", type = "npc", npc = "Lavarossa", id = "6038040720", detect = 150, range = 20, delay = 0.2, block = 0.4, on = true },
+    { name = "Lavarossa - L Punch", type = "npc", npc = "Lavarossa", id = "6038041916", detect = 150, range = 20, delay = 0.2, block = 0.4, on = true },
+    { name = "Cratos - Spin", type = "npc", npc = "Cratos", id = "6999923160", detect = 150, range = 30, delay = 0.1, block = 1.5, on = true },
+}
+
+-- Defaults are snapshotted so the builder can reset a move it has edited.
+Parry.defaults = {}
+for _, m in ipairs(Parry.moves) do
+    Parry.defaults[m.name] = { detect = m.detect, range = m.range, delay = m.delay, block = m.block, on = m.on }
+end
+
+---------------------------------------------------------------------
+-- CLIENT STATE (u32)
+--
+-- u32 is an upvalue of canM1, not a global, so it is picked out by shape
+-- rather than by index - upvalue order is not something to rely on.
+---------------------------------------------------------------------
+function Parry.resolveState()
+    Parry.state = nil
+
+    pcall(function()
+        for _, f in ipairs(getgc(false)) do
+            if type(f) == "function" then
+                local named, name = pcall(debug.info, f, "n")
+                if named and (name == "canM1" or name == "performM1") then
+                    for i = 1, 12 do
+                        local ok, _, val = pcall(debug.getupvalue, f, i)
+                        if ok and type(val) == "table"
+                            and rawget(val, "Occupied") ~= nil
+                            and rawget(val, "BlockCooldown") ~= nil then
+                            Parry.state = val
+                            return
+                        end
+                    end
+                end
+            end
+        end
+    end)
+
+    return Parry.state ~= nil
+end
+
+function Parry.dataFunction()
+    if not Parry.dataFn then
+        Parry.dataFn = RepStorage:WaitForChild("Events"):WaitForChild("DataFunction")
+    end
+    return Parry.dataFn
+end
+
+-- One-way latency in seconds. Data Ping is a round trip.
+function Parry.ping()
+    local ok, ms = pcall(function()
+        return game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
+    end)
+    if ok and type(ms) == "number" and ms > 0 then
+        Parry.lastPing = math.clamp((ms / 1000) / 2, 0, 0.5)
+    end
+    return Parry.lastPing
+end
+
+---------------------------------------------------------------------
+-- THE GATE - mirrors attemptBlock() exactly
+---------------------------------------------------------------------
+function Parry.canBlock()
+    local char = character()
+    if not char then return false end
+
+    -- Applies even in blatant mode: a block under a forcefield is refused and
+    -- a block while already blocking is wasted traffic.
+    if char:FindFirstChild("ForceField") then return false end
+    if char:GetAttribute("KotoamatsukamiAttacking") then return false end
+    if char:GetAttribute("KotoamatsukamiForceMove") then return false end
+    if settingFlag("Blocking") then return false end
+    if settingFlag("Stunned") then return false end
+
+    if Parry.blatant then return true end
+
+    local s = Parry.state
+    if s then
+        if s.Occupied ~= false then return false end
+        if s.BlockCooldown ~= false then return false end
+        if s.ShortCooldown ~= false then return false end
+        if s.BlockStartCooldown ~= false then return false end
+        if s.Knocked ~= false then return false end
+    else
+        -- No state table: fall back to what is visible from outside.
+        if settingFlag("Knocked") then return false end
+        local skill = settingText("CurrentSkill")
+        if skill and skill ~= "" then return false end
+        local grip = settingText("Gripping")
+        if grip and grip ~= "None" then return false end
+    end
+
+    return true
+end
+
+---------------------------------------------------------------------
+-- BLOCK / UNBLOCK - the same sequence the game performs
+---------------------------------------------------------------------
+function Parry.startBlock()
+    local char = character()
+    local hum  = char and char:FindFirstChildOfClass("Humanoid")
+    local s    = Parry.state
+
+    local settings = mySettings()
+    local blocking = settings and settings:FindFirstChild("Blocking")
+
+    if s then
+        s.BlockStartCooldown = true
+        s.Occupied = true
+    end
+    if blocking then blocking.Value = true end
+    if hum then
+        hum.WalkSpeed = 5
+        hum.JumpPower = 0
+    end
+
+    local accepted = false
+    pcall(function()
+        accepted = Parry.dataFunction():InvokeServer("Block") == true
+    end)
+
+    if accepted then
+        if s then s.BlockStartCooldown = false end
+        return true
+    end
+
+    -- Server said no: put everything back, exactly as attemptBlock does.
+    if blocking then blocking.Value = false end
+    if s then
+        s.BlockStartCooldown = false
+        s.Occupied = false
+    end
+    if hum then
+        hum.WalkSpeed = (s and s.OriginSpeed) or 16
+        hum.JumpPower = (s and s.OriginJump) or 50
+    end
+    return false
+end
+
+function Parry.endBlock()
+    local char = character()
+    local hum  = char and char:FindFirstChildOfClass("Humanoid")
+    local s    = Parry.state
+
+    -- The game refuses to release a block while stunned; releasing our own
+    -- state here would desync us from it.
+    if settingFlag("Stunned") then return end
+
+    if s then
+        s.Occupied = false
+        s.BlockCooldown = true
+    end
+    if hum then
+        hum.WalkSpeed = (s and s.OriginSpeed) or 16
+        hum.JumpPower = (s and s.OriginJump) or 50
+    end
+
+    pcall(function() Parry.dataFunction():InvokeServer("EndBlock") end)
+
+    task.delay(BLOCK_CD, function()
+        if s then s.BlockCooldown = false end
+    end)
+end
+
+-- delay is how long before the hit we want the block to EXIST.
+function Parry.block(delay, duration, move)
+    -- Skills flagged BlockBreaks in u20.Skills. The field is defined per skill
+    -- but never read anywhere in the client dumps, so whether a perfect block
+    -- beats one is unverified - and guessing wrong costs BlockBreakStunTime
+    -- (2s) every time. Off unless asked for.
+    if move and move.breaks and not Parry.parryBreaks then return end
+
+    local now = os.clock()
+    if now - Parry.lastParry < Parry.cooldown then return end
+    if not Parry.canBlock() then return end
+
+    Parry.lastParry = now
+
+    delay    = (delay or 0) + Parry.customDelay
+    duration = duration or 0.2
+
+    -- Auto Delay: fire early by one-way ping so the Block ARRIVES on time,
+    -- and aim for the middle of the perfect-block window rather than its edge.
+    if Parry.autoDelay then
+        delay = delay - Parry.ping() - (PB_WINDOW / 2)
+    end
+    if delay < 0 then delay = 0 end
+
+    task.spawn(function()
+        if delay > 0 then task.wait(delay) end
+        if not Parry.enabled or not Parry.canBlock() then return end
+        if not Parry.startBlock() then return end
+
+        task.delay(duration, Parry.endBlock)
+    end)
+end
+
+---------------------------------------------------------------------
+-- DETECTION
+---------------------------------------------------------------------
+function Parry.watchCloser(getPos, move, window)
+    task.spawn(function()
+        local started = os.clock()
+
+        while os.clock() - started < (window or 1.5) do
+            if not Parry.enabled then return end
+
+            local myRoot = root()
+            if not myRoot then return end
+
+            local pos = getPos()
+            if not pos then return end
+
+            if (pos - myRoot.Position).Magnitude <= move.range then
+                Parry.block(move.delay, move.block, move)
+                return
+            end
+
+            task.wait(0.016)
+        end
+    end)
+end
+
+function Parry.watchProjectile(obj, move)
+    Parry.watchCloser(function()
+        if not obj or not obj.Parent then return nil end
+        if obj:IsA("BasePart") then return obj.Position end
+        if obj:IsA("Model") then
+            local part = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
+            return part and part.Position
+        end
+        return nil
+    end, move, 5)
+end
+
+function Parry.scanObject(obj)
+    if not Parry.enabled then return end
+    if not (obj:IsA("BasePart") or obj:IsA("Model")) then return end
+
+    local lower = string.lower(obj.Name)
+    if string.find(lower, "dragon", 1, true) and string.find(obj.Name, LP.Name, 1, true) then
+        return
+    end
+
+    for _, move in ipairs(Parry.moves) do
+        if move.on and (move.type == "debris" or move.type == "workspace") then
+            if string.find(lower, string.lower(move.id), 1, true) then
+                Parry.watchProjectile(obj, move)
+                return
+            end
+        end
+    end
+end
+
+function Parry.hookAnimator(model, lookup)
+    local hum      = model and model:FindFirstChildOfClass("Humanoid")
+    local animator = hum and hum:FindFirstChildOfClass("Animator")
+    if not animator then return end
+
+    Parry.conns[#Parry.conns + 1] = bind(animator.AnimationPlayed:Connect(function(track)
+        if not Parry.enabled then return end
+
+        local id   = tostring(track.Animation and track.Animation.AnimationId or ""):match("(%d+)")
+        local move = id and lookup[id]
+        if not move or not move.on then return end
+
+        local myRoot = root()
+        if not myRoot then return end
+
+        local function sourcePos()
+            if not model or not model.Parent then return nil end
+            local part = model:FindFirstChild("HumanoidRootPart")
+                or model:FindFirstChild("Torso") or model.PrimaryPart
+            return part and part.Position
+        end
+
+        local pos = sourcePos()
+        if not pos or (pos - myRoot.Position).Magnitude > move.detect then return end
+
+        Parry.watchCloser(sourcePos, move, 1.5)
+    end))
+end
+
+function Parry.buildLookups()
+    local anim, beast, npc = {}, {}, {}
+    for _, move in ipairs(Parry.moves) do
+        if move.type == "animation" then
+            anim[move.id] = move
+        elseif move.type == "beast" then
+            beast[move.id] = move
+        elseif move.type == "npc" and move.npc then
+            npc[move.npc] = npc[move.npc] or {}
+            npc[move.npc][move.id] = move
+        end
+    end
+    return anim, beast, npc
+end
+
+function Parry.stop()
+    for _, c in ipairs(Parry.conns) do unbind(c) end
+    Parry.conns = {}
+end
+
+function Parry.start()
+    Parry.stop()
+    Parry.resolveState()
+
+    local animLookup, beastLookup, npcLookup = Parry.buildLookups()
+
+    local function watchPlayer(target)
+        if target == LP then return end
+        if target.Character then Parry.hookAnimator(target.Character, animLookup) end
+        Parry.conns[#Parry.conns + 1] = bind(target.CharacterAdded:Connect(function(char)
+            task.wait(0.5)
+            if Parry.enabled then Parry.hookAnimator(char, animLookup) end
+        end))
+    end
+
+    for _, target in ipairs(Players:GetPlayers()) do watchPlayer(target) end
+    Parry.conns[#Parry.conns + 1] = bind(Players.PlayerAdded:Connect(watchPlayer))
+
+    local debrisFolder = workspace:FindFirstChild("Debris")
+    if debrisFolder then
+        Parry.conns[#Parry.conns + 1] = bind(debrisFolder.ChildAdded:Connect(Parry.scanObject))
+        for _, obj in ipairs(debrisFolder:GetChildren()) do Parry.scanObject(obj) end
+    end
+
+    Parry.conns[#Parry.conns + 1] = bind(workspace.ChildAdded:Connect(function(obj)
+        if obj.Name == "Terrain" or obj.Name == "Camera" then return end
+        Parry.scanObject(obj)
+
+        if obj.Name == "Matatabi" then
+            task.delay(0.5, function()
+                if Parry.enabled then Parry.hookAnimator(obj, beastLookup) end
+            end)
+        elseif npcLookup[obj.Name] then
+            local lookup = npcLookup[obj.Name]
+            task.delay(0.5, function()
+                if Parry.enabled then Parry.hookAnimator(obj, lookup) end
+            end)
+        end
+    end))
+
+    local matatabi = workspace:FindFirstChild("Matatabi")
+    if matatabi then Parry.hookAnimator(matatabi, beastLookup) end
+
+    for npcName, lookup in pairs(npcLookup) do
+        local model = workspace:FindFirstChild(npcName)
+        if model then Parry.hookAnimator(model, lookup) end
+    end
+end
+
+-- The combat script is rebuilt with the character, so u32 must be re-found.
+bind(LP.CharacterAdded:Connect(function()
+    if not Parry.enabled then return end
+    task.delay(1.5, function()
+        if Parry.enabled then
+            Parry.resolveState()
+            Parry.start()
+        end
+    end)
+end))
+
+]==]
+-- ===================================================================
+-- AUTO PARRY - DISABLED
+--
+-- Commented out on request. Everything below is intact: uncomment the
+-- block (and the UI.parry* / UI.secBuilder sectors in the layout, and
+-- the Parry lines in unload) to bring it back.
+-- ===================================================================
+--[==[
+
+---------------------------------------------------------------------
+-- AUTO PARRY UI
+---------------------------------------------------------------------
+UI.parry.element("Toggle", "Auto Parry", nil, function(v)
+    Parry.enabled = v.Toggle
+    if v.Toggle then
+        Parry.start()
+        notify("Combat", Parry.state
+            and "Auto Parry on - using the game's own block gate"
+            or  "Auto Parry on - state table not found, degraded checks", 5)
+    else
+        Parry.stop()
+        notify("Combat", "Auto Parry disabled")
+    end
+end)
+
+UI.parry.element("Toggle", "Auto Delay (ping aware)", { default = { Toggle = true } }, function(v)
+    Parry.autoDelay = v.Toggle
+    notify("Combat", v.Toggle
+        and "Auto Delay on - blocks fire early by your ping"
+        or  "Auto Delay off - using raw per-move delays", 4)
+end)
+
+UI.parry.element("Toggle", "Blatant", nil, function(v)
+    Parry.blatant = v.Toggle
+    notify("Combat", v.Toggle
+        and "Blatant on - skips the state gate (will block when it cannot)"
+        or  "Blatant off - full gate, matches the game", 5)
+end)
+
+UI.parry.element("Toggle", "Parry Block-Breakers", nil, function(v)
+    Parry.parryBreaks = v.Toggle
+    notify("Combat", v.Toggle
+        and "Will parry BlockBreaks moves - unverified, 2s stun if wrong"
+        or  "Skipping BlockBreaks moves", 5)
+end)
+
+UI.parry.element("Slider", "Extra Delay", {
+    default = { min = -200, max = 300, default = 0 },
+    suffix  = " ms",
+}, function(v)
+    Parry.customDelay = v.Slider / 1000
+end)
+
+UI.parry.element("Slider", "Parry Cooldown", {
+    default = { min = 0, max = 1000, default = 300 },
+    suffix  = " ms",
+}, function(v)
+    Parry.cooldown = v.Slider / 1000
+end)
+
+UI.parry.element("Button", "Re-find Client State", nil, function()
+    if Parry.resolveState() then
+        notify("Combat", "Found the client state table")
+    else
+        notify("Combat", "Not found - needs getgc/debug.getupvalue", 5)
+    end
+end)
+
+-- Live readout so the ping maths is visible rather than implied.
+do
+    local label = UI.parry.element("Label", "ping -- ms | fires -- ms early")
+    bind(RunService.Heartbeat:Connect(function()
+        if not Parry.enabled then return end
+        if os.clock() - (Parry._labelAt or 0) < 0.5 then return end
+        Parry._labelAt = os.clock()
+
+        local one = Parry.ping()
+        label:set_text(string.format("ping %d ms | fires %d ms early",
+            math.floor(one * 2000), math.floor((one + PB_WINDOW / 2) * 1000)))
+    end))
+end
+
+-- One combo per source: a name can repeat across sources, and each list needs
+-- its own selection.
+do
+    local groups = {
+        { label = "Player Moves", kinds = { animation = true, debris = true, workspace = true } },
+        { label = "Beast Moves",  kinds = { beast = true } },
+        { label = "NPC Moves",    kinds = { npc = true } },
+    }
+
+    for _, group in ipairs(groups) do
+        local members, names, defaults = {}, {}, {}
+        for _, move in ipairs(Parry.moves) do
+            if group.kinds[move.type] then
+                members[#members + 1] = move
+                names[#names + 1]     = move.name
+                if move.on then defaults[#defaults + 1] = move.name end
+            end
+        end
+
+        UI.parryMoves.element("Combo", group.label, {
+            options = names,
+            default = { Combo = defaults },
+        }, function(v)
+            for _, move in ipairs(members) do
+                move.on = table.find(v.Combo, move.name) ~= nil
+            end
+            if Parry.enabled then Parry.start() end
+        end)
+    end
+end
+
+---------------------------------------------------------------------
+-- PARRY BUILDER
+--
+-- Same job as the standalone builder window: pick a move, edit its detection
+-- range, parry range, delay and block duration, add your own moves. Built out
+-- of the menu's own elements so it matches everything else.
+--
+-- Selecting a move drives the sliders to its values, and moving a slider
+-- writes straight back to the live move table - no apply step, no separate
+-- copy of the data to fall out of sync.
+---------------------------------------------------------------------
+Parry.builder = { selected = nil, sliders = {}, loading = false }
+
+function Parry.moveNames()
+    local names = {}
+    for _, m in ipairs(Parry.moves) do names[#names + 1] = m.name end
+    table.sort(names)
+    return names
+end
+
+function Parry.findMove(name)
+    for _, m in ipairs(Parry.moves) do
+        if m.name == name then return m end
+    end
+end
+
+function Parry.builderLoad(move)
+    if not move then return end
+
+    Parry.builder.loading = true
+    local sl = Parry.builder.sliders
+    if sl.detect then sl.detect:set_value({ Slider = move.detect }, true) end
+    if sl.range  then sl.range:set_value({ Slider = move.range }, true) end
+    if sl.delay  then sl.delay:set_value({ Slider = math.floor(move.delay * 1000) }, true) end
+    if sl.block  then sl.block:set_value({ Slider = math.floor(move.block * 1000) }, true) end
+    if sl.on     then sl.on:set_value({ Toggle = move.on }, true) end
+    Parry.builder.loading = false
+
+    if Parry.builder.info then
+        Parry.builder.info:set_text(string.format("%s  |  id %s%s",
+            move.type, tostring(move.id), move.breaks and "  |  BLOCK-BREAKER" or ""))
+    end
+end
+
+Parry.builder.dropdown = UI.builder.element("Dropdown", "Move", {
+    options = Parry.moveNames(),
+}, function(v)
+    Parry.builder.selected = Parry.findMove(v.Dropdown)
+    Parry.builderLoad(Parry.builder.selected)
+end)
+
+Parry.builder.info = UI.builder.element("Label", "select a move")
+
+-- Writes land on the live table immediately; `loading` stops the programmatic
+-- set_value calls from writing back over the move we are reading from.
+local function builderWrite(field, scale)
+    return function(v)
+        if Parry.builder.loading then return end
+        local move = Parry.builder.selected
+        if not move then return end
+        move[field] = v.Slider / (scale or 1)
+    end
+end
+
+Parry.builder.sliders.detect = UI.builder.element("Slider", "Detection Range", {
+    default = { min = 10, max = 300, default = 80 }, suffix = " studs",
+}, builderWrite("detect"))
+
+Parry.builder.sliders.range = UI.builder.element("Slider", "Parry Range", {
+    default = { min = 5, max = 120, default = 30 }, suffix = " studs",
+}, builderWrite("range"))
+
+Parry.builder.sliders.delay = UI.builder.element("Slider", "Parry Delay", {
+    default = { min = 0, max = 1000, default = 0 }, suffix = " ms",
+}, builderWrite("delay", 1000))
+
+Parry.builder.sliders.block = UI.builder.element("Slider", "Block Duration", {
+    default = { min = 100, max = 4000, default = 200 }, suffix = " ms",
+}, builderWrite("block", 1000))
+
+Parry.builder.sliders.on = UI.builder.element("Toggle", "Move Enabled", nil, function(v)
+    if Parry.builder.loading then return end
+    local move = Parry.builder.selected
+    if not move then return end
+    move.on = v.Toggle
+    if Parry.enabled then Parry.start() end
+end)
+
+UI.builder.element("Button", "Reset This Move", nil, function()
+    local move = Parry.builder.selected
+    if not move then return end
+
+    local d = Parry.defaults[move.name]
+    if not d then
+        notify("Builder", "Custom move - nothing to reset to", 4)
+        return
+    end
+
+    move.detect, move.range, move.delay, move.block, move.on = d.detect, d.range, d.delay, d.block, d.on
+    Parry.builderLoad(move)
+    if Parry.enabled then Parry.start() end
+    notify("Builder", "Reset " .. move.name)
+end)
+
+UI.builder.element("Button", "Reset All Moves", nil, function()
+    for _, move in ipairs(Parry.moves) do
+        local d = Parry.defaults[move.name]
+        if d then
+            move.detect, move.range, move.delay, move.block, move.on = d.detect, d.range, d.delay, d.block, d.on
+        end
+    end
+    Parry.builderLoad(Parry.builder.selected)
+    if Parry.enabled then Parry.start() end
+    notify("Builder", "All moves reset to defaults")
+end)
+
+---------------------------------------------------------------------
+-- CUSTOM MOVES
+--
+-- Pair this with the Move Tracker: the tracker prints an animation id and
+-- copies it to the clipboard, and this turns it into a parryable move.
+---------------------------------------------------------------------
+Parry.newMove = { name = "", id = "", kind = "animation", npc = "" }
+
+UI.builderAdd.element("TextBox", "Move Name", { maxlen = 40 }, function(v)
+    Parry.newMove.name = v.Text
+end)
+
+UI.builderAdd.element("TextBox", "Animation ID / Object Name", { maxlen = 40 }, function(v)
+    Parry.newMove.id = v.Text
+end)
+
+UI.builderAdd.element("Dropdown", "Source", {
+    options = { "animation", "debris", "workspace", "beast", "npc" },
+    default = { Dropdown = "animation" },
+}, function(v)
+    Parry.newMove.kind = v.Dropdown
+end)
+
+UI.builderAdd.element("TextBox", "NPC Name (npc source only)", { maxlen = 40 }, function(v)
+    Parry.newMove.npc = v.Text
+end)
+
+UI.builderAdd.element("Button", "Add Move", nil, function()
+    local n = Parry.newMove
+
+    if n.name == "" or n.id == "" then
+        notify("Builder", "Name and ID are both required", 4)
+        return
+    end
+    if Parry.findMove(n.name) then
+        notify("Builder", "A move called that already exists", 4)
+        return
+    end
+    if n.kind == "npc" and n.npc == "" then
+        notify("Builder", "NPC source needs the NPC's name", 4)
+        return
+    end
+
+    local move = {
+        name = n.name, type = n.kind, id = n.id,
+        detect = 80, range = 30, delay = 0, block = 0.4, on = true,
+    }
+    if n.kind == "npc" then move.npc = n.npc end
+
+    Parry.moves[#Parry.moves + 1] = move
+    Parry.builder.dropdown:refresh(Parry.moveNames(), true)
+    if Parry.enabled then Parry.start() end
+
+    notify("Builder", "Added " .. move.name .. " - now tune it under Edit Move", 5)
+end)
+
+UI.builderAdd.element("Button", "Delete Selected Move", nil, function()
+    local move = Parry.builder.selected
+    if not move then return end
+
+    for i, m in ipairs(Parry.moves) do
+        if m == move then
+            table.remove(Parry.moves, i)
+            break
+        end
+    end
+
+    Parry.builder.selected = nil
+    Parry.builder.dropdown:refresh(Parry.moveNames())
+    if Parry.enabled then Parry.start() end
+    notify("Builder", "Deleted " .. move.name)
+end)
+
+---------------------------------------------------------------------
+-- TIMING REFERENCE (read out of the game's own settings table)
+---------------------------------------------------------------------
+UI.builderInfo.element("Label", "PerfectBlockWindow   0.25 s")
+UI.builderInfo.element("Label", "PerfectBlockCooldown 0.60 s")
+UI.builderInfo.element("Label", "BlockCooldown        0.50 s")
+UI.builderInfo.element("Label", "MeleeStunTime        0.60 s")
+UI.builderInfo.create_line()
+UI.builderInfo.element("Label", "A block parries if the hit lands")
+UI.builderInfo.element("Label", "within 0.25s of it starting.")
+UI.builderInfo.element("Label", "Auto Delay aims for the middle")
+UI.builderInfo.element("Label", "of that window, minus your ping.")
+
+yield(true)
+
+]==]
+-- ===================================================================
+-- AUTO PARRY - DISABLED
+--
+-- Commented out on request. Everything below is intact: uncomment the
+-- block (and the UI.parry* / UI.secBuilder sectors in the layout, and
+-- the Parry lines in unload) to bring it back.
+-- ===================================================================
+--[==[
+
+---------------------------------------------------------------------
+-- MOVE TRACKER
+--
+-- Read-only. Reports every animation id played near you, once each, with who
+-- played it and the distance - then copies the id so it can go straight into
+-- the Custom Move box.
+---------------------------------------------------------------------
+Parry.tracker = { enabled = false, conns = {}, seen = {} }
+
+function Parry.trackerHook(model, label)
+    local hum      = model and model:FindFirstChildOfClass("Humanoid")
+    local animator = hum and hum:FindFirstChildOfClass("Animator")
+    if not animator then return end
+
+    local t = Parry.tracker
+    t.conns[#t.conns + 1] = bind(animator.AnimationPlayed:Connect(function(track)
+        if not t.enabled then return end
+
+        local id = tostring(track.Animation and track.Animation.AnimationId or ""):match("(%d+)")
+        if not id or t.seen[id] then return end
+        t.seen[id] = true
+
+        local myRoot = root()
+        local part   = model:FindFirstChild("HumanoidRootPart")
+            or model:FindFirstChild("Torso") or model.PrimaryPart
+        local dist   = (myRoot and part)
+            and math.floor((part.Position - myRoot.Position).Magnitude) or 0
+
+        notify("Tracker", string.format("%s  %s  (%d studs)", label, id, dist), 8)
+        if setclipboard then pcall(setclipboard, id) end
+    end))
+end
+
+function Parry.trackerStop()
+    for _, c in ipairs(Parry.tracker.conns) do unbind(c) end
+    Parry.tracker.conns = {}
+end
+
+function Parry.trackerStart()
+    Parry.trackerStop()
+    local t = Parry.tracker
+
+    local function watch(target)
+        if target == LP then return end
+        if target.Character then Parry.trackerHook(target.Character, target.Name) end
+        t.conns[#t.conns + 1] = bind(target.CharacterAdded:Connect(function(char)
+            task.wait(0.5)
+            if t.enabled then Parry.trackerHook(char, target.Name) end
+        end))
+    end
+
+    for _, target in ipairs(Players:GetPlayers()) do watch(target) end
+    t.conns[#t.conns + 1] = bind(Players.PlayerAdded:Connect(watch))
+
+    for _, obj in ipairs(workspace:GetChildren()) do
+        if obj:IsA("Model") and obj:FindFirstChildOfClass("Humanoid") and not isPlayerModel(obj) then
+            Parry.trackerHook(obj, obj.Name)
+        end
+    end
+
+    t.conns[#t.conns + 1] = bind(workspace.ChildAdded:Connect(function(obj)
+        if not t.enabled then return end
+        task.delay(0.5, function()
+            if t.enabled and obj.Parent and obj:IsA("Model")
+                and obj:FindFirstChildOfClass("Humanoid") and not isPlayerModel(obj) then
+                Parry.trackerHook(obj, obj.Name)
+            end
+        end)
+    end))
+end
+
+UI.parryTracker.element("Toggle", "Log Animation IDs", nil, function(v)
+    Parry.tracker.enabled = v.Toggle
+    if v.Toggle then
+        Parry.trackerStart()
+        notify("Tracker", "Logging new animation ids (copied to clipboard)", 5)
+    else
+        Parry.trackerStop()
+        notify("Tracker", "Tracker off")
+    end
+end)
+
+UI.parryTracker.element("Button", "Reset Seen List", nil, function()
+    Parry.tracker.seen = {}
+    notify("Tracker", "Seen list cleared", 2)
+end)
+
+UI.parryTracker.create_line()
+UI.parryTracker.element("Label", "Each id is reported once, then")
+UI.parryTracker.element("Label", "copied. Paste it into Custom Move")
+UI.parryTracker.element("Label", "to make it parryable.")
+
+yield(true)
+
+]==]
+
+---------------------------------------------------------------------
+-- AUTO RAMEN CONTEST
+--
+-- Choji's eating contest is the Akimichi unlock for Butterfly Mode
+-- [Stage 2]. Requirements to start: Bloodline Akimichi, Butterfly Mode
+-- already learned, and 15x Ramen in the inventory.
+--
+-- The whole contest is decided on the client: the game counts your bowls and
+-- Choji's in two local variables and only ever tells the server the verdict
+-- ("WonRamenContest" / "LostRamenContest"). Eating reaches the server as two
+-- events per bowl:
+--
+--     DataEvent:FireServer("Consumed", "Ramen", actionTime)   -- eats it
+--     DataEvent:FireServer("RamenInventorySwap")              -- ramen -> bowl
+--
+-- Firing only the swap does nothing, which is the trap here: the bowl counter
+-- moves but nothing is actually consumed.
+--
+-- Choji averages ~1.5s a bowl with scripted pauses at bowl 3 and 8, so the
+-- default 1.2s pace wins with room to spare while looking exactly like
+-- someone eating at full speed.
+---------------------------------------------------------------------
+local Ramen = {
+    enabled    = false,
+    bowls      = 15,
+    gap        = 1.2,
+    startDelay = 10,
+    thread     = nil,
+    toggle     = nil,
+}
+
+-- The client sends the item's own ActionTime as the third argument, so read
+-- the real number instead of guessing at it.
+function Ramen.actionTime()
+    local value = 1.2
+    pcall(function()
+        local GM   = require(RepStorage:WaitForChild("GameManager"))
+        local item = GM.Items and GM.Items.Ramen
+        if item and item.ActionTime then value = item.ActionTime end
+    end)
+    return value
+end
+
+-- One full set of bowls, then report the win.
+function Ramen.eatRound()
+    local actionTime = Ramen.actionTime()
+
+    for i = 1, Ramen.bowls do
+        if not Ramen.enabled then return false end
+
+        pcall(function()
+            RepStorage.Events.DataEvent:FireServer("Consumed", "Ramen", actionTime)
+            RepStorage.Events.DataEvent:FireServer("RamenInventorySwap")
+        end)
+
+        task.wait(Ramen.gap)
+    end
+
+    task.wait(0.3)
+    pcall(function()
+        RepStorage.Events.DataEvent:FireServer("WonRamenContest")
+    end)
+
+    return true
+end
+
+function Ramen.stop()
+    Ramen.enabled = false
+    if Ramen.thread then
+        pcall(function() task.cancel(Ramen.thread) end)
+        Ramen.thread = nil
+    end
+end
+
+function Ramen.start()
+    Ramen.thread = task.spawn(function()
+        while Ramen.enabled do
+            -- Starting the round clones the Ramen Shop into workspace, so its
+            -- presence is a reliable "a contest is set up" signal.
+            pcall(function()
+                RepStorage.Events.DataEvent:FireServer("StartRamenContest")
+            end)
+
+            local deadline = os.clock() + 8
+            while Ramen.enabled and not workspace:FindFirstChild("Ramen Shop") do
+                if os.clock() > deadline then break end
+                task.wait(0.2)
+            end
+
+            if not Ramen.enabled then return end
+
+            if not workspace:FindFirstChild("Ramen Shop") then
+                notify("Ramen", "Contest did not start - check you have 15x Ramen", 6)
+                Ramen.stop()
+                if Ramen.toggle then Ramen.toggle:set_value({ Toggle = false }, true) end
+                return
+            end
+
+            -- Choji's dialog and the countdown run before the real start.
+            notify("Ramen", "Contest up - eating in " .. Ramen.startDelay .. "s", 4)
+            local waited = 0
+            while Ramen.enabled and waited < Ramen.startDelay do
+                task.wait(0.5)
+                waited = waited + 0.5
+            end
+
+            if not Ramen.enabled then return end
+            if not Ramen.eatRound() then return end
+
+            notify("Ramen", "Round done", 4)
+
+            -- The shop is destroyed ~5s after the verdict; wait for it to go
+            -- before starting the next one, or the re-fire lands mid-teardown.
+            local clear = os.clock() + 20
+            while Ramen.enabled and workspace:FindFirstChild("Ramen Shop") do
+                if os.clock() > clear then break end
+                task.wait(0.5)
+            end
+
+            task.wait(2)
+        end
+    end)
+end
+
+Ramen.toggle = UI.ramen.element("Toggle", "Auto Ramen Contest", nil, function(v)
+    Ramen.enabled = v.Toggle
+    if v.Toggle then
+        Ramen.start()
+        notify("Ramen", "Auto Ramen Contest started")
+    else
+        Ramen.stop()
+        notify("Ramen", "Auto Ramen Contest stopped")
+    end
+end)
+
+UI.ramen.element("Button", "Eat Now (one round)", nil, function()
+    -- For when you are already sitting in a contest you started by hand.
+    task.spawn(function()
+        local was = Ramen.enabled
+        Ramen.enabled = true
+        Ramen.eatRound()
+        Ramen.enabled = was
+        notify("Ramen", "Round done", 3)
+    end)
+end)
+
+UI.ramen.create_line()
+
+UI.ramen.element("Slider", "Bowls", {
+    default = { min = 1, max = 15, default = 15 },
+}, function(v)
+    Ramen.bowls = v.Slider
+end)
+
+UI.ramen.element("Slider", "Eat Pace", {
+    default = { min = 200, max = 2000, default = 1200 },
+    suffix  = " ms",
+}, function(v)
+    Ramen.gap = v.Slider / 1000
+end)
+
+UI.ramen.element("Slider", "Start Delay", {
+    default = { min = 0, max = 30, default = 10 },
+    suffix  = " s",
+}, function(v)
+    Ramen.startDelay = v.Slider
+end)
+
+UI.ramen.element("Label", "Needs Akimichi + Butterfly Mode")
+UI.ramen.element("Label", "and 15x Ramen per round.")
+
+yield(true)
+
+---------------------------------------------------------------------
+-- HOLD TO M1
+--
+-- The obvious implementations both fail, for the same reason:
+--
+--   Synthetic clicks (VirtualInputManager) and re-firing InputBegan both end
+--   up in the game's onKeyDown, and its MouseButton1 branch does not attack -
+--   it only sets u32.HoldingMouseButton1, which is used solely for HELD-SKILL
+--   logic. Setting a flag that is already true does nothing, so the loop runs
+--   and no swing happens.
+--
+-- The swing actually comes from performM1(), called behind canM1(). Both are
+-- globals in the game LocalScript's environment, so they can be called
+-- directly - which is also the better option: the combo counter, the
+-- animation and the CheckMeleeHit all stay consistent because it is the
+-- game's own code doing them.
+--
+-- canM1() already gates on cooldown, stun, blocking, gripping, forcefield,
+-- consuming and dashing, so the poll can be fast and simply no-ops until the
+-- game says the next swing is legal.
+---------------------------------------------------------------------
+local M1 = {
+    enabled   = false,
+    rate      = 0.02,
+    held      = false,
+    loop      = nil,
+    perform   = nil,
+    can       = nil,
+    resolveAt = 0,
+}
+
+-- Walk the GC for either function and lift both out of its environment. They
+-- are script globals, not _G entries, so the environment is the way in.
+function M1.resolve()
+    M1.perform, M1.can = nil, nil
+
+    local ok = pcall(function()
+        for _, f in ipairs(getgc(false)) do
+            if type(f) == "function" then
+                local named, name = pcall(debug.info, f, "n")
+                if named and (name == "performM1" or name == "canM1") then
+                    local env = getfenv(f)
+                    M1.perform = rawget(env, "performM1") or M1.perform
+                    M1.can     = rawget(env, "canM1")     or M1.can
+                    if M1.perform and M1.can then return end
+                end
+            end
+        end
+    end)
+
+    M1.resolveAt = os.clock()
+    return ok and M1.perform ~= nil
+end
+
+function M1.stop()
+    M1.held = false
+    if M1.loop then
+        pcall(function() task.cancel(M1.loop) end)
+        M1.loop = nil
+    end
+end
+
+function M1.start()
+    M1.stop()
+
+    M1.loop = task.spawn(function()
+        while M1.enabled do
+            if M1.held and M1.perform then
+                -- canM1 is the game's own legality check; if it is missing for
+                -- any reason, fall through and let performM1 decide.
+                if not M1.can or M1.can() then
+                    pcall(M1.perform)
+                end
+            end
+            task.wait(M1.rate)
+        end
+    end)
+end
+
+bind(K.Services.UserInputService.InputBegan:Connect(function(input, processed)
+    if not M1.enabled or processed then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        M1.held = true
+    end
+end))
+
+bind(K.Services.UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        M1.held = false
+    end
+end))
+
+-- The combat script is rebuilt with the character, so a cached performM1 from
+-- a previous life points at an environment whose upvalues are dead. Re-resolve
+-- rather than calling into a stale closure.
+bind(LP.CharacterAdded:Connect(function()
+    if not M1.enabled then return end
+    task.delay(1.5, function()
+        if M1.enabled then M1.resolve() end
+    end)
+end))
+
+UI.autoM1.element("Toggle", "Hold to M1", nil, function(v)
+    M1.enabled = v.Toggle
+
+    if v.Toggle then
+        if not M1.resolve() then
+            M1.enabled = false
+            notify("Combat", "Could not find performM1 - executor needs getgc/getfenv", 6)
+            return
+        end
+        M1.start()
+        notify("Combat", "Hold to M1 enabled")
+    else
+        M1.stop()
+        notify("Combat", "Hold to M1 disabled")
+    end
+end)
+
 
 yield(true)
 
@@ -7148,7 +8674,11 @@ local function unload()
     pcall(setNoclip, false)
     pcall(omniStop)
     pcall(chargeStop)
+    pcall(chakraStop)
     pcall(masteryStop)
+    pcall(Ramen.stop)
+    M1.enabled = false
+    pcall(M1.stop)
     Hitbox.enabled = false
     pcall(hitboxStop)
     pcall(senseStop)
