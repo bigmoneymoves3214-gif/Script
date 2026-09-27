@@ -2209,6 +2209,10 @@ UI.secMiscData       = TabMisc.new_section("Data")
 UI.boxViewData       = UI.secMiscData.new_sector("View Data", "Left")
 UI.boxPurchase       = UI.secMiscData.new_sector("Purchase", "Right")
 
+UI.secFarm           = TabMisc.new_section("Farm")
+UI.mastery           = UI.secFarm.new_sector("Auto Farm Mastery", "Left")
+UI.masteryOpt        = UI.secFarm.new_sector("Options", "Right")
+
 UI.secUtility        = TabMisc.new_section("Utility")
 UI.spectate          = UI.secUtility.new_sector("Spectate", "Left")
 UI.server            = UI.secUtility.new_sector("Server", "Right")
@@ -2920,6 +2924,168 @@ UI.playerUtil.element("Toggle", "Infinite Chakra Charge", nil, function(v)
         chargeStop()
         notify("Player", "Infinite Chakra Charge disabled")
     end
+end)
+
+---------------------------------------------------------------------
+-- HITBOX EXTENDER
+--
+-- The game spawns a Hitbox part for dash-type moves and parents the rest to
+-- the character. Both carry a TouchInterest, and firetouchinterest is the
+-- only primitive that can drive one: replicatesignal will not work here,
+-- because cansignalreplicate on BasePart.Touched returns false and Roblox's
+-- replication whitelist has no TouchTransmitter entry at all. That also means
+-- the server's own distance check on the Touched handler still applies - this
+-- widens the window, it does not bypass the server.
+--
+-- Only fires while CurrentSkill is one of the moves below, bails the moment
+-- the skill changes, and skips knocked players (they cannot be hit anyway,
+-- so touching them is pure noise on the wire).
+---------------------------------------------------------------------
+local Hitbox = {
+    enabled   = false,
+    size      = 8,
+    conn      = nil,
+    whitelist = {},
+
+    -- Moves whose hitbox lives in workspace.Debris rather than on the
+    -- character. Everything else is looked up by skill name under the
+    -- character itself.
+    debrisMoves = {
+        ["Lion's Barrage"]  = true,
+        ["Dynamic Entry"]   = true,
+        ["Thrusting Strike"]= true,
+        ["Primary Lotus"]   = true,
+        ["Cleave Rush"]     = true,
+        ["Vertical Slash"]  = true,
+    },
+
+    moves = {
+        "Lion's Barrage", "Cleave Rush", "Dynamic Entry", "Rasengan",
+        "Rasengan Barrage", "Fire Seal", "Thrusting Strike", "Water Prison",
+        "Chidori", "Primary Lotus", "Wood Seal", "Vertical Slash",
+        "Rasenshuriken", "Fireball", "Weighted Kick", "Leaf Whirlwind",
+    },
+}
+
+local function fireTouch(part, otherHRP)
+    if not part or not otherHRP then return end
+    if not firetouchinterest then return end
+    if not part:FindFirstChild("TouchInterest") then return end
+
+    pcall(function()
+        firetouchinterest(part, otherHRP, 0)
+        firetouchinterest(part, otherHRP, 1)
+    end)
+end
+
+-- Targets worth touching: not us, not whitelisted, not knocked, in range.
+local function hitboxTargets(myPos)
+    local out = {}
+    local settings = gameSettings()
+
+    for _, target in ipairs(Players:GetPlayers()) do
+        if target ~= LP and not table.find(Hitbox.whitelist, target.Name) then
+            local char = target.Character
+            local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+
+            if hrp and (hrp.Position - myPos).Magnitude <= Hitbox.size then
+                local ps      = settings and settings:FindFirstChild(target.Name)
+                local knocked = ps and ps:FindFirstChild("Knocked")
+                if not (knocked and knocked.Value == true) then
+                    out[#out + 1] = hrp
+                end
+            end
+        end
+    end
+
+    return out
+end
+
+local function hitboxStop()
+    unbind(Hitbox.conn)
+    Hitbox.conn = nil
+end
+
+local function hitboxStart()
+    hitboxStop()
+
+    Hitbox.conn = bind(RunService.Heartbeat:Connect(function()
+        if not Hitbox.enabled then return end
+
+        local char = character()
+        local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+
+        local skill = settingText("CurrentSkill")
+        if not skill or skill == "" then return end
+        if not table.find(Hitbox.moves, skill) then return end
+
+        local targets = hitboxTargets(hrp.Position)
+        if #targets == 0 then return end
+
+        if Hitbox.debrisMoves[skill] then
+            local debrisFolder = workspace:FindFirstChild("Debris")
+            if not debrisFolder then return end
+
+            for _, part in ipairs(debrisFolder:GetChildren()) do
+                -- The skill can end mid-sweep; stop rather than touch with a
+                -- hitbox that no longer belongs to the move being used.
+                if settingText("CurrentSkill") ~= skill then return end
+                if part.Name == "Hitbox" then
+                    for _, otherHRP in ipairs(targets) do
+                        fireTouch(part, otherHRP)
+                    end
+                end
+            end
+
+        elseif skill == "Rasengan Barrage" then
+            -- This one is two parts, one per hand.
+            for _, side in ipairs({ "RasenganLeft", "RasenganRight" }) do
+                local part = char:FindFirstChild(side)
+                for _, otherHRP in ipairs(targets) do
+                    fireTouch(part, otherHRP)
+                end
+            end
+
+        else
+            local part = char:FindFirstChild(skill)
+            for _, otherHRP in ipairs(targets) do
+                fireTouch(part, otherHRP)
+            end
+        end
+    end))
+end
+
+UI.playerUtil.element("Toggle", "Hitbox Extender", nil, function(v)
+    Hitbox.enabled = v.Toggle
+
+    if v.Toggle then
+        if not firetouchinterest then
+            Hitbox.enabled = false
+            notify("Player", "This executor has no firetouchinterest", 5)
+            return
+        end
+        hitboxStart()
+        notify("Player", "Hitbox Extender enabled")
+    else
+        hitboxStop()
+        notify("Player", "Hitbox Extender disabled")
+    end
+end)
+
+UI.playerUtil.element("Slider", "Hitbox Size", {
+    default = { min = 1, max = 15, default = 8 },
+    suffix  = " studs",
+}, function(v)
+    Hitbox.size = v.Slider
+end)
+
+UI.playerUtil.element("TextBox", "Hitbox Whitelist (comma sep)", { maxlen = 120 }, function(v)
+    local list = {}
+    for name in string.gmatch(v.Text, "[^,]+") do
+        list[#list + 1] = (name:gsub("^%s*(.-)%s*$", "%1"))
+    end
+    Hitbox.whitelist = list
 end)
 
 yield(true)
@@ -5681,6 +5847,233 @@ end)
 yield(true)
 
 ---------------------------------------------------------------------
+-- AUTO FARM MASTERY
+--
+-- Two completely different jobs behind one toggle, because the game grants
+-- mastery two different ways:
+--
+--   Regular skills - fire DataEvent "startSkill" <name> then "ReleaseSkill"
+--     on a loop. Several skills can be cycled by entering them comma
+--     separated. Nothing is reset and nothing teleports.
+--
+--   Awaken modes - mastery only ticks while the mode is active, and the mode
+--     can only be re-entered from a fresh character. The public script does
+--     that by invoking "Awaken" and then destroying the character's Head to
+--     force a respawn, sitting at the safespot while the spawn forcefield
+--     burns down so nobody watches it happen.
+--
+-- "Don't Reset" turns the second half off: it still enters the mode, but it
+-- never destroys your Head and never teleports you. You keep the mode for as
+-- long as it naturally lasts and stay exactly where you are.
+--
+-- Both paths pause while the chakra sense watcher says somebody is looking.
+---------------------------------------------------------------------
+local AWAKEN_MODES = {
+    "Sharingan [Stage 1]", "Sharingan [Stage 2]", "Sharingan [Stage 3]",
+    "Obito's Mangekyo", "Obito's Eternal Mangekyo",
+    "Itachi's Mangekyo", "Itachi's Eternal Mangekyo",
+    "Sasuke's Mangekyo", "Sasuke's Eternal Mangekyo",
+    "Pain's Rinnegan", "Sasuke's Rinnegan",
+    "Byakugan [Stage 1]", "Byakugan [Stage 2]", "Byakugan [Stage 3]", "Byakugan [Stage 4]",
+    "Hinata's Byakugan", "Neji's Byakugan",
+    "Adamantine Sealing Chains", "Hundred Healings",
+    "Green Gates", "Blue Gates",
+    "Butterfly Mode", "Butterfly Mode V2", "Akamichi Mode",
+    "Ketsuryugan [Stage 1]", "Ketsuryugan [Stage 2]", "Ketsuryugan [Stage 3]",
+    "Jinchuriki [Stage 1]", "Jinchuriki [Stage 2]",
+    "Matatabi Cloak", "Shukaku Cloak", "Isobu Cloak",
+}
+
+local Mastery = {
+    enabled     = false,
+    input       = "",
+    noReset     = false,
+    thread      = nil,
+    respawnConn = nil,
+    toggle      = nil,
+}
+
+local function isAwakenMode(name)
+    return table.find(AWAKEN_MODES, name) ~= nil
+end
+
+local function masteryStop()
+    Mastery.enabled = false
+
+    if Mastery.thread then
+        pcall(function() task.cancel(Mastery.thread) end)
+        Mastery.thread = nil
+    end
+    if Mastery.respawnConn then
+        unbind(Mastery.respawnConn)
+        Mastery.respawnConn = nil
+    end
+end
+
+-- Returns nil plus a reason when the input cannot be used.
+local function masterySkills()
+    local text = Mastery.input
+
+    if text == "" then
+        return nil, "Enter a skill or mode name first"
+    end
+
+    if not string.find(text, ",") then
+        return { text }
+    end
+
+    -- A space either side of a comma would make the skill name wrong, and the
+    -- server silently does nothing rather than erroring - so catch it here.
+    if string.find(text, ", ") or string.find(text, " ,") then
+        return nil, "Remove the spaces around commas, e.g. Water Dragon,Water Prison"
+    end
+
+    local list = {}
+    for skill in string.gmatch(text, "[^,]+") do
+        list[#list + 1] = skill
+    end
+
+    for _, skill in ipairs(list) do
+        if isAwakenMode(skill) then
+            return nil, "Awaken modes cannot be cycled - remove: " .. skill
+        end
+    end
+
+    return list
+end
+
+-- Block here for as long as somebody is watching with chakra sense.
+local function masteryWaitClear()
+    while K.beingObserved and Mastery.enabled do
+        task.wait(0.5)
+    end
+    return Mastery.enabled
+end
+
+local function masteryAwakenCycle(mode)
+    task.wait(0.1)
+    if not masteryWaitClear() then return end
+
+    local char = character() or LP.CharacterAdded:Wait()
+    local hrp  = char and char:WaitForChild("HumanoidRootPart", 10)
+    if not hrp or not Mastery.enabled then return end
+
+    -- Ride out the spawn forcefield. With resetting on we wait it out parked
+    -- at the safespot; with it off we just wait where we are.
+    repeat
+        task.wait()
+        if not masteryWaitClear() then return end
+        if not Mastery.noReset then
+            pcall(function() safeTeleport(CFrame.new(Safe.safespot), true) end)
+        end
+    until not char:FindFirstChild("ForceField") or char.Parent == nil or not Mastery.enabled
+
+    if not masteryWaitClear() then return end
+    if not (char and char.Parent and hrp and hrp.Parent) then return end
+
+    pcall(function()
+        RepStorage:WaitForChild("Events"):WaitForChild("DataFunction"):InvokeServer("Awaken", mode)
+    end)
+
+    if Mastery.noReset then return end
+
+    task.wait(0.1)
+    local head = char:FindFirstChild("Head")
+    if head then
+        pcall(function() head:Destroy() end)
+    end
+end
+
+local function masteryStart()
+    local skills, reason = masterySkills()
+    if not skills then
+        notify("Farm", reason, 5)
+        masteryStop()
+        if Mastery.toggle then Mastery.toggle:set_value({ Toggle = false }, true) end
+        return
+    end
+
+    local awaken = (#skills == 1) and isAwakenMode(skills[1])
+
+    if awaken then
+        local mode = skills[1]
+
+        -- Without a reset there is no cycle to drive, so this runs once per
+        -- natural respawn instead of once per forced one.
+        Mastery.respawnConn = bind(LP.CharacterAdded:Connect(function()
+            if not Mastery.enabled then return end
+            task.spawn(masteryAwakenCycle, mode)
+        end))
+
+        if character() then
+            Mastery.thread = task.spawn(masteryAwakenCycle, mode)
+        end
+
+        notify("Farm", "Farming " .. mode .. (Mastery.noReset and " (no reset)" or ""), 4)
+        return
+    end
+
+    Mastery.thread = task.spawn(function()
+        local index = 1
+
+        while Mastery.enabled do
+            if not masteryWaitClear() then break end
+
+            local skill = skills[index]
+
+            pcall(function()
+                RepStorage:WaitForChild("Events"):WaitForChild("DataEvent"):FireServer("startSkill", skill)
+            end)
+            task.wait()
+
+            pcall(function()
+                RepStorage:WaitForChild("Events"):WaitForChild("DataEvent"):FireServer("ReleaseSkill")
+            end)
+            task.wait()
+
+            index = index + 1
+            if index > #skills then index = 1 end
+        end
+    end)
+
+    notify("Farm", "Farming " .. table.concat(skills, ", "), 4)
+end
+
+UI.mastery.element("TextBox", "Skill / Mode Name", { maxlen = 120 }, function(v)
+    Mastery.input = v.Text
+end)
+
+Mastery.toggle = UI.mastery.element("Toggle", "Auto Farm Mastery", nil, function(v)
+    Mastery.enabled = v.Toggle
+
+    if v.Toggle then
+        masteryStart()
+    else
+        masteryStop()
+        notify("Farm", "Auto Farm Mastery disabled")
+    end
+end)
+
+UI.mastery.create_line()
+UI.mastery.element("Label", "Comma separate to cycle skills")
+UI.mastery.element("Label", "(no spaces around the commas)")
+
+UI.masteryOpt.element("Toggle", "Don't Reset", nil, function(v)
+    Mastery.noReset = v.Toggle
+    notify("Farm", v.Toggle
+        and "Reset off - no teleport, no head destroy"
+        or  "Reset on - will safespot and force respawn", 4)
+end)
+
+UI.masteryOpt.create_line()
+UI.masteryOpt.element("Label", "Awaken modes normally reset you")
+UI.masteryOpt.element("Label", "to re-enter the mode. Don't Reset")
+UI.masteryOpt.element("Label", "keeps you put and skips that.")
+UI.masteryOpt.element("Label", "Regular skills never reset either way.")
+
+yield(true)
+
+---------------------------------------------------------------------
 -- READ-ONLY EXTRAS
 --
 -- Everything in this block is passive: it reads replicated state or moves the
@@ -6755,6 +7148,9 @@ local function unload()
     pcall(setNoclip, false)
     pcall(omniStop)
     pcall(chargeStop)
+    pcall(masteryStop)
+    Hitbox.enabled = false
+    pcall(hitboxStop)
     pcall(senseStop)
     pcall(stopMobRegistry)
     pcall(restoreVisuals)
