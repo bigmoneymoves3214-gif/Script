@@ -2234,6 +2234,7 @@ UI.secUtility        = TabMisc.new_section("Utility")
 UI.spectate          = UI.secUtility.new_sector("Spectate", "Left")
 UI.server            = UI.secUtility.new_sector("Server", "Right")
 UI.watchers          = UI.secUtility.new_sector("Watchers", "Left")
+UI.unwipe            = UI.secUtility.new_sector("Unwipe", "Right")
 
 -- Security
 UI.secSecurity       = TabSecurity.new_section("Protection")
@@ -7596,6 +7597,163 @@ UI.autoM1.element("Toggle", "Hold to M1", nil, function(v)
     end
 end)
 
+
+yield(true)
+
+---------------------------------------------------------------------
+-- UNWIPE
+--
+-- A wiped character has LifeForce == 0. The two revival quests, "Samurai's
+-- Retribution" and "Reaver's Revenge", can each be started once; a quest that
+-- already reads "FinishedGood" has been spent and cannot be used again.
+--
+-- The unwipe itself is just StartQuest on both, then reading the progress
+-- back to make the server commit it. The black overlay is cosmetic - it hides
+-- the respawn flicker while the server works.
+--
+-- Eligibility is worth checking first because starting a quest you cannot
+-- finish spends nothing but tells you nothing either: each quest also wants
+-- an item (Lava Snakeskin / Samurai Soul) that has to already be on you.
+---------------------------------------------------------------------
+do
+    local QUESTS = {
+        { quest = "Samurai's Retribution", item = "Lava Snakeskin" },
+        { quest = "Reaver's Revenge",      item = "Samurai Soul" },
+    }
+
+    local function dataFunction()
+        return RepStorage:WaitForChild("Events"):WaitForChild("DataFunction")
+    end
+
+    local function questProgress(name)
+        local ok, result = pcall(function()
+            return dataFunction():InvokeServer("GetQuestProgress", name)
+        end)
+        if not ok then return nil end
+        return result
+    end
+
+    local function ownsItem(data, itemName)
+        local function scan(location)
+            if type(location) ~= "table" then return false end
+            for _, entry in pairs(location) do
+                if type(entry) == "table" and entry.Item == itemName then
+                    return true
+                end
+            end
+            return false
+        end
+        return scan(data.Inventory) or scan(data.Loadout)
+    end
+
+    UI.unwipe.element("Button", "Check If Eligible", nil, function()
+        task.spawn(function()
+            local usable = {}
+
+            for _, q in ipairs(QUESTS) do
+                local progress = questProgress(q.quest)
+                if progress == nil then
+                    notify("Unwipe", "Failed to check eligibility", 4)
+                    return
+                end
+                -- Anything other than FinishedGood means the quest is still
+                -- available to us.
+                if progress ~= "FinishedGood" then
+                    usable[#usable + 1] = q
+                end
+            end
+
+            if #usable == 0 then
+                notify("Unwipe", "Not eligible - both revival quests are spent", 5)
+                return
+            end
+
+            local ok, data = pcall(function()
+                return dataFunction():InvokeServer("GetData")
+            end)
+            if not ok or type(data) ~= "table" then
+                notify("Unwipe", "Eligible, but could not read your inventory", 5)
+                return
+            end
+
+            local missing = {}
+            for _, q in ipairs(usable) do
+                if not ownsItem(data, q.item) then
+                    missing[#missing + 1] = q.item
+                end
+            end
+
+            if #missing > 0 then
+                notify("Unwipe", "Eligible, but missing: " .. table.concat(missing, ", "), 6)
+            else
+                notify("Unwipe", "Eligible for unwipe", 4)
+            end
+        end)
+    end)
+
+    UI.unwipe.element("Button", "Unwipe", nil, function()
+        task.spawn(function()
+            local ok, data = pcall(function()
+                return dataFunction():InvokeServer("GetData")
+            end)
+
+            if not ok or type(data) ~= "table" then
+                notify("Unwipe", "Failed to get player data", 4)
+                return
+            end
+
+            if data.LifeForce ~= 0 then
+                notify("Unwipe", "You are not wiped", 4)
+                return
+            end
+
+            -- Cosmetic cover for the respawn flicker while the server works.
+            local overlay = Instance.new("ScreenGui")
+            overlay.Name           = K.Services.HttpService:GenerateGUID(false)
+            overlay.IgnoreGuiInset = true
+            overlay.DisplayOrder   = 999
+            overlay.ResetOnSpawn   = false
+            overlay.Parent         = hiddenParent()
+
+            local black = Instance.new("Frame")
+            black.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+            black.Size             = UDim2.new(1, 0, 1, 0)
+            black.BorderSizePixel  = 0
+            black.Parent           = overlay
+
+            local text = Instance.new("TextLabel")
+            text.BackgroundTransparency = 1
+            text.Size       = UDim2.new(1, 0, 1, 0)
+            text.Font       = Enum.Font.Ubuntu
+            text.Text       = "Unwiping"
+            text.TextColor3 = Color3.fromRGB(255, 255, 255)
+            text.TextSize   = 48
+            text.Parent     = black
+
+            pcall(function()
+                for _, q in ipairs(QUESTS) do
+                    dataFunction():InvokeServer("StartQuest", q.quest)
+                end
+
+                task.wait(0.5)
+
+                -- Reading the progress back is what makes the server commit.
+                for _, q in ipairs(QUESTS) do
+                    dataFunction():InvokeServer("GetQuestProgress", q.quest)
+                end
+
+                task.wait(4)
+            end)
+
+            pcall(function() overlay:Destroy() end)
+            notify("Unwipe", "Unwipe done", 4)
+        end)
+    end)
+
+    UI.unwipe.create_line()
+    UI.unwipe.element("Label", "Only works while wiped")
+    UI.unwipe.element("Label", "(LifeForce 0).")
+end
 
 yield(true)
 
