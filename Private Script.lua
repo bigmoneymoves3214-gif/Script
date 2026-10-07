@@ -2212,6 +2212,7 @@ UI.secWorld          = TabVisuals.new_section("World")
 UI.itemESP           = UI.secWorld.new_sector("Item ESP", "Left")
 UI.camera            = UI.secWorld.new_sector("Camera", "Right")
 UI.worldVisuals      = UI.secWorld.new_sector("World Visuals", "Left")
+UI.performance       = UI.secWorld.new_sector("Performance", "Right")
 
 -- Teleports
 UI.secTpLocations    = TabTeleports.new_section("Locations")
@@ -2271,6 +2272,8 @@ K.flags = {
     silentAim        = false,
     noCrowShake      = false,
     instantKunai     = false,
+    forceOptimize    = false,
+    removeParticles  = false,
 }
 
 local function character()
@@ -7672,6 +7675,8 @@ do
         fov360      = false,
         maxDistance = 500,
         teamCheck   = false,
+        visibleCheck = false, -- only targets you have line of sight to
+        ignoreDowned = true,  -- skip knocked / being-carried players
         whitelist   = {},    -- list of player names to never target
         showFov     = false,
         prediction  = false,
@@ -7709,64 +7714,200 @@ do
         return table.find(cfg.whitelist, target.Name) ~= nil
     end
 
+    -- Knocked / being carried, read off ReplicatedStorage.Settings.<name> -
+    -- the same Knocked and BeingCarried ("None" when free) values the game
+    -- itself checks.
+    local function downed(target)
+        local s  = gameSettings()
+        local ps = s and s:FindFirstChild(target.Name)
+        if not ps then return false end
+        local knocked = ps:FindFirstChild("Knocked")
+        if knocked and knocked.Value == true then return true end
+        local carried = ps:FindFirstChild("BeingCarried")
+        return carried ~= nil and carried.Value ~= "None" and carried.Value ~= ""
+    end
+
+    -- Line of sight from the camera. RespectCanCollide lets non-collidable
+    -- parts (foliage, effects, hitboxes) through, and a hit on some other
+    -- character still counts as visible - only world geometry blocks.
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType        = Enum.RaycastFilterType.Exclude
+    rayParams.IgnoreWater       = true
+    rayParams.RespectCanCollide = true
+    local rayChar, rayDebris = nil, nil
+
+    local function visibleTo(cam, char, part)
+        local me, debris = LP.Character, workspace:FindFirstChild("Debris")
+        if me ~= rayChar or debris ~= rayDebris then
+            rayChar, rayDebris = me, debris
+            rayParams.FilterDescendantsInstances = { me, debris }
+        end
+        local origin = cam.CFrame.Position
+        local result = workspace:Raycast(origin, part.Position - origin, rayParams)
+        if not result then return true end
+        local hit = result.Instance
+        if hit:IsDescendantOf(char) then return true end
+        local model = hit:FindFirstAncestorOfClass("Model")
+        return model ~= nil and model:FindFirstChildOfClass("Humanoid") ~= nil
+    end
+
+    -- Body first, then the head (peeking over cover).
+    local function canSee(cam, char, hrp)
+        if visibleTo(cam, char, hrp) then return true end
+        local head = char:FindFirstChild("Head")
+        return head ~= nil and visibleTo(cam, char, head)
+    end
+
+    -- Full checks for one candidate (team, whitelist, knocked/carried,
+    -- health, line of sight). pickTarget only calls this for a player who
+    -- would beat the current best, so with a full server the Settings
+    -- lookups and raycasts run for a handful of players a frame instead of
+    -- all of them - same result: the lowest score among valid players.
+    local function valid(plr, char, hrp, cam)
+        if teammate(plr) or whitelisted(plr) then return false end
+        if cfg.ignoreDowned and downed(plr) then return false end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 then return false end
+        return not cfg.visibleCheck or canSee(cam, char, hrp)
+    end
+
     -- Closest valid target: by screen distance to crosshair (FOV mode) or by
-    -- world distance (360 mode, ignores where it is on screen). Skips dead,
-    -- teammates (if on) and whitelisted players. maxOverride lets Instant
-    -- Kunai pick within its own range instead of Silent Aim's Max Range.
+    -- world distance (360 mode, ignores where it is on screen). maxOverride
+    -- lets Instant Kunai pick within its own range instead of Max Range.
     local function pickTarget(maxOverride)
         local cam = workspace.CurrentCamera
         local myRoot = root()
         if not cam or not myRoot then return nil end
 
-        local center  = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+        local vp      = cam.ViewportSize
+        local cx, cy  = vp.X / 2, vp.Y / 2
         local myPos   = myRoot.Position
         local maxDist = maxOverride or cfg.maxDistance
+        local fov     = cfg.fov
         local best, bestScore = nil, math.huge
 
         for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= LP and plr.Character and not teammate(plr) and not whitelisted(plr) then
-                local hum = plr.Character:FindFirstChildOfClass("Humanoid")
-                local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
-                if hum and hrp and hum.Health > 0 then
-                    local worldDist = (hrp.Position - myPos).Magnitude
-                    if worldDist <= maxDist then
-                        if cfg.fov360 then
-                            -- closest in the world, anywhere around you
-                            if worldDist < bestScore then
-                                bestScore, best = worldDist, hrp
-                            end
-                        else
-                            local sp, onScreen = cam:WorldToViewportPoint(hrp.Position)
-                            if onScreen then
-                                local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
-                                if d <= cfg.fov and d < bestScore then
-                                    bestScore, best = d, hrp
-                                end
-                            end
+            local char = plr ~= LP and plr.Character
+            local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                local pos       = hrp.Position
+                local worldDist = (pos - myPos).Magnitude
+                if worldDist <= maxDist then
+                    local score = nil
+                    if cfg.fov360 then
+                        score = worldDist -- closest in the world, anywhere around you
+                    else
+                        local sp, onScreen = cam:WorldToViewportPoint(pos)
+                        if onScreen then
+                            local dx, dy = sp.X - cx, sp.Y - cy
+                            local d = math.sqrt(dx * dx + dy * dy)
+                            if d <= fov then score = d end
                         end
+                    end
+                    if score and score < bestScore and valid(plr, char, hrp, cam) then
+                        bestScore, best = score, hrp
                     end
                 end
             end
         end
         return best
     end
-    -- Shared with Instant Kunai so both use the same FOV/360/range/whitelist.
+    -- Shared with Instant Kunai so both use the same targeting filters.
     K.silentAimPick = pickTarget
+
+    -- Mouse override. "Hit" covers position-aimed moves; "X"/"Y" cover the ones
+    -- that aim via Mouse.X/Y + ScreenPointToRay (Lightning Strike etc.). Target
+    -- is left alone so NPC and UI clicks keep working.
+    --
+    -- The hook is built once and only SWAPPED INTO the metatable while there
+    -- is a cached target (see refresh). The faked values only ever applied
+    -- with a target cached, so behaviour is identical - but with nobody in
+    -- FOV, the Hold key up, or Toggle off, every property read in the game
+    -- runs the untouched native __index: zero overhead. While hooked, a
+    -- non-mouse read costs one upvalue pointer compare and a pass-through.
+    local idx = { mt = nil, real = nil, hook = nil, on = false }
+
+    local function installIndex()
+        if idx.hook then return true end
+        if not (getrawmetatable and setreadonly) then
+            notify("Combat", "Silent Aim needs getrawmetatable + setreadonly", 6)
+            return false
+        end
+        local ok = pcall(function()
+            local ncc   = newcclosure or function(f) return f end
+            local mouse = LP:GetMouse()
+            local mt    = getrawmetatable(game)
+            local real  = mt.__index
+            idx.mt, idx.real = mt, real
+            idx.hook = ncc(function(self, key)
+                if self == mouse then
+                    if key == "Hit" then
+                        local v = cfg.cachedHit
+                        if v then return v end
+                    elseif key == "X" then
+                        local v = cfg.cachedX
+                        if v then return v end
+                    elseif key == "Y" then
+                        local v = cfg.cachedY
+                        if v then return v end
+                    end
+                end
+                return real(self, key)
+            end)
+        end)
+        if not ok then idx.hook = nil end
+        return ok
+    end
+
+    -- Swap between exactly our hook and the __index we wrapped. If anything
+    -- else has hooked __index on top in the meantime it is left alone rather
+    -- than clobbered or chained into a loop (our hook just stays underneath,
+    -- passing through whenever the cache is empty).
+    local function setHooked(want)
+        if want == idx.on or not idx.hook then return end
+        pcall(function()
+            local mt  = idx.mt
+            local cur = mt.__index
+            if want and cur == idx.real then
+                setreadonly(mt, false)
+                mt.__index = idx.hook
+                setreadonly(mt, true)
+            elseif not want and cur == idx.hook then
+                setreadonly(mt, false)
+                mt.__index = idx.real
+                setreadonly(mt, true)
+            end
+            idx.on = mt.__index == idx.hook
+        end)
+    end
+
+    local function uninstallIndex()
+        setHooked(false)
+    end
 
     -- Per-frame cache. The full scan runs here once, NOT on every Hit read.
     local refreshConn = nil
+
+    local function clearCache()
+        cfg.cachedHit, cfg.cachedX, cfg.cachedY = nil, nil, nil
+        setHooked(false)
+    end
+
+    local function stopRefresh()
+        if refreshConn then refreshConn:Disconnect() refreshConn = nil end
+        clearCache()
+    end
+
     local function refresh()
-        -- Key not active (Hold released / Toggle off): clear the cache so the
-        -- hook hands back the real mouse until the key turns it back on.
-        if not K.flags.silentAim or not aimKeyActive() then
-            cfg.cachedHit, cfg.cachedX, cfg.cachedY = nil, nil, nil
-            return
-        end
+        -- Feature switched off some other way (e.g. a flag reset): shut down.
+        if not K.flags.silentAim then stopRefresh() return end
+        -- Key not active (Hold released / Toggle off): hand back the real
+        -- mouse until the key turns it back on.
+        if not aimKeyActive() then clearCache() return end
+
         local hrp = pickTarget()
-        if not hrp then
-            cfg.cachedHit, cfg.cachedX, cfg.cachedY = nil, nil, nil
-            return
-        end
+        if not hrp then clearCache() return end
+
         local pos = hrp.Position
         if cfg.prediction then
             local vel = hrp.AssemblyLinearVelocity or hrp.Velocity or Vector3.zero
@@ -7787,63 +7928,13 @@ do
                 cfg.cachedX, cfg.cachedY = nil, nil
             end
         end
+
+        setHooked(true)
     end
+
     local function startRefresh()
         if refreshConn then return end
         refreshConn = RunService.RenderStepped:Connect(refresh)
-    end
-    local function stopRefresh()
-        if refreshConn then refreshConn:Disconnect() refreshConn = nil end
-        cfg.cachedHit = nil
-    end
-
-    -- Mouse override. "Hit" covers position-aimed moves; "X"/"Y" cover the ones
-    -- that aim via Mouse.X/Y + ScreenPointToRay (Lightning Strike etc.). Target
-    -- is left alone so NPC and UI clicks keep working. Body is O(1): a pointer
-    -- compare and a cached read. Installed while on, restored when off so there
-    -- is zero __index overhead with the feature disabled.
-    local idx = { on = false, mt = nil, old = nil, mouse = nil }
-    local function installIndex()
-        if idx.on then return true end
-        if not (getrawmetatable and setreadonly) then
-            notify("Combat", "Silent Aim needs getrawmetatable + setreadonly", 6)
-            return false
-        end
-        local ncc = newcclosure or function(f) return f end
-        local ok = pcall(function()
-            idx.mouse = LP:GetMouse()
-            local mt  = getrawmetatable(game)
-            idx.mt    = mt
-            idx.old   = mt.__index
-            setreadonly(mt, false)
-            mt.__index = ncc(function(self, key)
-                if K.flags.silentAim and self == idx.mouse then
-                    if key == "Hit" then
-                        local ch = cfg.cachedHit
-                        if ch then return ch end
-                    elseif key == "X" then
-                        local cx = cfg.cachedX
-                        if cx then return cx end
-                    elseif key == "Y" then
-                        local cy = cfg.cachedY
-                        if cy then return cy end
-                    end
-                end
-                return idx.old(self, key)
-            end)
-            setreadonly(mt, true)
-        end)
-        idx.on = ok
-        return ok
-    end
-    local function uninstallIndex()
-        if not idx.on then return end
-        pcall(function()
-            setreadonly(idx.mt, false)
-            idx.mt.__index = idx.old
-            setreadonly(idx.mt, true)
-        end)
-        idx.on = false
     end
 
     -- FOV ring: one Drawing, driven only while the feature and the ring are on.
@@ -7928,6 +8019,14 @@ do
 
     UI.silentAim.element("Toggle", "Team Check", nil, function(v)
         cfg.teamCheck = v.Toggle
+    end)
+
+    UI.silentAim.element("Toggle", "Visible Check", nil, function(v)
+        cfg.visibleCheck = v.Toggle
+    end)
+
+    UI.silentAim.element("Toggle", "Ignore Knocked / Carried", ON, function(v)
+        cfg.ignoreDowned = v.Toggle
     end)
 
     local function whitelistNames()
@@ -8053,8 +8152,9 @@ end
 -- Only kunais we OWN that SPAWNED within 12 studs of us are touched, so
 -- someone else's kunai passing by (which can auto-transfer ownership to us)
 -- is never hijacked. Nothing is added to our HRP (BanMe 1E stays clean).
--- Targeting is Silent Aim's picker (FOV / 360 / whitelist / team) with its
--- own range (Kunai Max Distance). No target -> the kunai flies normally.
+-- Targeting is Silent Aim's picker (FOV / 360 / whitelist / team / visible /
+-- knocked-carried) with its own range (Kunai Max Distance). No target -> the
+-- kunai flies normally.
 ---------------------------------------------------------------------
 do
     local conn     = nil
@@ -8114,22 +8214,36 @@ do
         pcall(firetouchinterest, part, hitPart, 1)
     end
 
+    -- Your weapon name, re-read at most once a second rather than per Debris
+    -- part - combat floods Debris with effect parts.
+    local weaponName, weaponAt = nil, -math.huge
+    local function currentWeapon()
+        local now = os.clock()
+        if now - weaponAt > 1 then
+            weaponName, weaponAt = settingText("CurrentWeapon"), now
+        end
+        return weaponName
+    end
+
     -- The thrown part is named after the weapon ("Raijin Kunai") plus
     -- SmallKunai2/3 for Multi. Nutcracker Raijin and the Daggers are kunai-type
     -- weapons whose names don't contain "kunai", so match those too.
     local function isThrownKunai(d)
-        if not d:IsA("BasePart") then return false end
         local n = d.Name:lower()
-        if n:find("kunai") or n:find("dagger") or n:find("raijin") then return true end
-        local weapon = settingText("CurrentWeapon")
+        if n:find("kunai", 1, true) or n:find("dagger", 1, true) or n:find("raijin", 1, true) then
+            return true
+        end
+        local weapon = currentWeapon()
         return weapon ~= nil and d.Name == weapon
     end
 
+    -- Cheapest rejects first: type, then distance (most Debris effects spawn
+    -- nowhere near you), and only then the name checks.
     local function onDebrisChild(d)
-        if not K.flags.instantKunai then return end
-        if not isThrownKunai(d) then return end
+        if not K.flags.instantKunai or not d:IsA("BasePart") then return end
         local myRoot = root()
         if not myRoot or (d.Position - myRoot.Position).Magnitude > 12 then return end
+        if not isThrownKunai(d) then return end
         task.spawn(strike, d)
     end
 
@@ -8163,6 +8277,440 @@ do
     }, function(v)
         maxRange = v.Slider
     end)
+end
+
+---------------------------------------------------------------------
+-- FORCE OPTIMIZE (client-side map + NPC streaming, map particles)
+--
+-- Profiled live: the game is CPU-bound, not GPU-bound. Graphics quality
+-- 10 vs 1 and shadows did nothing - the GPU only draws ~200 batches. The
+-- cost is the engine's per-object work on EVERYTHING loaded:
+-- StreamingEnabled is off, so the whole map (~55k parts) and every NPC
+-- (~150-185) stay loaded and processed every frame wherever you are.
+-- Stacked at one test spot:
+--     normal                          103 FPS   CPU 9.7 ms
+--     far map chunks streamed out     184 FPS   CPU 5.4 ms
+--     + far NPCs streamed out         281 FPS   CPU 3.5 ms
+--     + ambient particles stopped     343 FPS   CPU 2.9 ms
+--
+-- So this is the streaming the developers left off, done on our client:
+-- the map is split once into chunks (static models / loose static parts);
+-- chunks and NPCs beyond Render Distance are parented to nil locally and
+-- put back as you approach. The server, other players and hit detection
+-- never see any of it.
+--
+-- Safety:
+--  * Never touched: every workspace child the game's client scripts or this
+--    script look up by name (area detection, waters, Chakra Points, Mission
+--    Boards, Debris, quest props, boss doors, named NPCs, ...), player
+--    characters, dropped items (an "ID" child), and any chunk with unanchored
+--    parts (it could move, so its cached position would go stale).
+--  * Teleports / respawns: if your position jumps, everything within SAFE
+--    studs comes back inside Stepped - before physics - so the floor at the
+--    destination is there before you can fall; the rest streams in.
+--  * Hysteresis (hide only HYST studs past the radius) so things at the
+--    edge don't flicker.
+--  * Turning it off, or the script's flag reset, puts everything back.
+--
+-- Cost of the streamer itself: a chunk whose edge is M studs from the
+-- show/hide line can't cross it until you've moved M studs, so it isn't
+-- re-checked until then (~30 checks a frame instead of every chunk), and
+-- reparenting is capped per frame so walking into a new area streams it in
+-- over a few frames instead of one big hitch.
+---------------------------------------------------------------------
+do
+    local EXCLUDE = {}
+    for _, n in ipairs({
+        -- referenced by the game's client scripts (gamescript + GameManager)
+        "Terrain", "Camera", "Debris", "Locations", "ChakraPoints", "Crates",
+        "Waters", "WaterBlocks", "voidPaths", "TB_Spawns", "RandomSpawns",
+        "ThunderStormLocations", "Rifts", "SharkSpot", "DoorsModel", "ImplantBed",
+        "Hyuga BossEntrances", "Haku BossIcy Mirror", "Mirror Realm",
+        "FrostyKamuiDecor", "KamuiEntrance", "KamuiExit", "KamuiWebs",
+        "ObitoStoneBlock", "IsobuButtons", "DeepForestEmergence", "Ramen Shop",
+        "XPShark", "XPChain", "SwimmingShark", "SoulChain", "SharkmanShark",
+        "ScarletShark", "QuestChain", "ButtonChain", "MandaInvisFloor", "WormDoor",
+        "BasaltDoor", "Dog", "DeprivedDamselLines", "Uzumaki Heirloom",
+        "The Wise Tree", "ScarletSlowcoachEnd", "ScarletSlowcoachFailedEnd",
+        "Bob", "Might Guy", "OutKeeper", "Training Instructor",
+        "The 1st Zetsu", "The 2nd Zetsu", "The 3rd Zetsu", "The 4th Zetsu",
+        "The Deprived Damsel", "The Reanimated Reaver", "The Scarlet Slowcoach",
+        -- referenced by this script (and the armor-repair Medic lookup)
+        "Mission Boards", "TorchMesh", "The Fashioneer", "Chef", "Matatabi",
+        "Medic",
+    }) do EXCLUDE[n] = true end
+
+    local SWEEP   = 0.3  -- seconds for the round-robin to pass every chunk
+    local MAXV    = 200  -- studs/s assumed top speed between re-checks
+    local JUMP    = 60   -- studs moved in one frame that counts as a teleport
+    local HYST    = 75   -- extra studs before a visible chunk / NPC hides
+    local SAFE    = 150  -- after a teleport, chunks this close return at once
+    local BUDGET  = 400  -- parts reparented per frame in normal streaming
+    local NPC_DT  = 0.25 -- NPC distance check interval (they move)
+    local SCAN_DT = 3    -- interval for picking up newly spawned NPCs
+
+    local S = {
+        radius = 600,
+        npcs   = true,   -- "Include NPCs"
+        state  = "idle", -- idle -> building -> ready (built once, reused)
+        conn   = nil,
+        count  = 0,
+        cursor = 1,
+        lastFocus = nil,
+        npcTimer = 0, scanTimer = 0,
+        -- parallel arrays, one entry per chunk
+        inst = {}, parent = {}, center = {}, extent = {}, parts = {},
+        hidden = {}, dead = {}, due = {},
+    }
+    -- streamed NPCs: { m = model, p = parent, hidden, dead }
+    local N = { list = {}, set = {} }
+
+    -- One pass over a candidate: is anything in it unanchored (so it could
+    -- move), and how many parts would reparenting it touch.
+    local function inspect(inst)
+        local parts, dynamic = 0, false
+        if inst:IsA("BasePart") then
+            parts, dynamic = 1, not inst.Anchored
+        end
+        for _, d in ipairs(inst:GetDescendants()) do
+            if d:IsA("BasePart") then
+                parts = parts + 1
+                if not d.Anchored then dynamic = true end
+            end
+        end
+        return dynamic, parts
+    end
+
+    local function addChunk(inst, center, extent, parts)
+        local n = S.count + 1
+        S.count = n
+        S.inst[n], S.parent[n] = inst, inst.Parent
+        S.center[n], S.extent[n], S.parts[n] = center, extent, parts
+        S.hidden[n], S.dead[n], S.due[n] = false, false, 0
+    end
+
+    -- Static models small enough to be one unit become chunks, as do loose
+    -- static parts. Folders, map-sized models and anything holding an NPC
+    -- are descended into instead.
+    local visited = 0
+    local function consider(inst, depth)
+        visited = visited + 1
+        if visited % 400 == 0 then task.wait() end -- spread the scan over frames
+
+        if inst.Parent == workspace and EXCLUDE[inst.Name] then return end
+        if inst:FindFirstChild("ID") then return end -- dropped item
+        if inst:IsA("Model") and inst:FindFirstChildOfClass("Humanoid") then return end
+
+        if inst:IsA("BasePart") then
+            local dynamic, parts = inspect(inst)
+            if not dynamic then addChunk(inst, inst.Position, inst.Size.Magnitude / 2, parts) end
+            return
+        end
+
+        if inst:IsA("Model") or inst:IsA("Folder") then
+            if inst:IsA("Model") and not inst:FindFirstChildWhichIsA("Humanoid", true) then
+                local ok, cf, size = pcall(inst.GetBoundingBox, inst)
+                if ok and cf and size.Magnitude < 3000 then
+                    local dynamic, parts = inspect(inst)
+                    if not dynamic then addChunk(inst, cf.Position, size.Magnitude / 2, parts) end
+                    return
+                end
+            end
+            if depth < 6 then
+                for _, ch in ipairs(inst:GetChildren()) do consider(ch, depth + 1) end
+            end
+        end
+    end
+
+    local function build()
+        S.state = "building"
+        visited = 0
+        for _, ch in ipairs(workspace:GetChildren()) do consider(ch, 0) end
+        S.state = "ready"
+    end
+
+    -- Hide only from where we found it; if the server moved or destroyed a
+    -- chunk, stop managing it rather than fight the server.
+    local function setHidden(i, want)
+        local inst = S.inst[i]
+        if want then
+            if inst.Parent ~= S.parent[i] then S.dead[i] = true return end
+            if pcall(function() inst.Parent = nil end) then S.hidden[i] = true
+            else S.dead[i] = true end
+        else
+            if pcall(function() inst.Parent = S.parent[i] end) then S.hidden[i] = false
+            else S.dead[i] = true end
+        end
+    end
+
+    -- Distance to the chunk's edge from the nearer of your character and
+    -- the camera focus (so observing someone far away loads their area).
+    local function chunkDist(i, a, b)
+        local c = S.center[i]
+        local d = math.huge
+        if a then d = (c - a).Magnitude end
+        if b then
+            local d2 = (c - b).Magnitude
+            if d2 < d then d = d2 end
+        end
+        return d - S.extent[i]
+    end
+
+    -- Re-check chunk i, then schedule its next check from how far its edge
+    -- is from the show/hide line (it can't cross it any sooner). Returns the
+    -- number of parts reparented, for the per-frame budget.
+    local function evaluate(i, a, b, now, showR, hideR, budget)
+        local d = chunkDist(i, a, b)
+        local hidden = S.hidden[i]
+        local moved = 0
+        if (hidden and d < showR) or (not hidden and d > hideR) then
+            -- Over this frame's budget: retry next sweep. The first
+            -- reparent of a frame always goes through, however big.
+            if S.parts[i] > budget and budget < BUDGET then
+                S.due[i] = now
+                return 0
+            end
+            setHidden(i, not hidden)
+            hidden = S.hidden[i]
+            moved = S.parts[i]
+        end
+        local margin = hidden and (d - showR) or (hideR - d)
+        if margin < 0 then margin = 0 end
+        S.due[i] = now + math.clamp(margin / MAXV, 0.05, 20)
+        return moved
+    end
+
+    -----------------------------------------------------------------
+    -- NPCs: models directly under workspace with a Humanoid that aren't a
+    -- player's character. They move, so they're tracked live by pivot on a
+    -- timer instead of cached. New spawns are picked up by a periodic scan;
+    -- despawned ones drop out. PRIVATE's Mob ESP already handles mobs
+    -- leaving and re-entering workspace.
+    -----------------------------------------------------------------
+    local function npcSetHidden(e, want)
+        if want then
+            if e.m.Parent ~= e.p then e.dead = true return end
+            if pcall(function() e.m.Parent = nil end) then e.hidden = true else e.dead = true end
+        else
+            if pcall(function() e.m.Parent = e.p end) then e.hidden = false else e.dead = true end
+        end
+    end
+
+    local function scanNPCs()
+        for _, ch in ipairs(workspace:GetChildren()) do
+            if ch:IsA("Model") and not N.set[ch] and not EXCLUDE[ch.Name]
+               and ch:FindFirstChildOfClass("Humanoid")
+               and not Players:GetPlayerFromCharacter(ch) then
+                local e = { m = ch, p = workspace, hidden = false, dead = false }
+                N.set[ch] = e
+                N.list[#N.list + 1] = e
+            end
+        end
+    end
+
+    local function updateNPCs(a, b, showR, hideR)
+        local keep = {}
+        for _, e in ipairs(N.list) do
+            if not e.dead and not e.hidden and e.m.Parent ~= e.p then
+                e.dead = true -- despawned or moved by the server
+            end
+            if not e.dead then
+                local ok, pivot = pcall(e.m.GetPivot, e.m)
+                if ok then
+                    local pos = pivot.Position
+                    local d = math.huge
+                    if a then d = (pos - a).Magnitude end
+                    if b then
+                        local d2 = (pos - b).Magnitude
+                        if d2 < d then d = d2 end
+                    end
+                    if e.hidden and d < showR then
+                        npcSetHidden(e, false)
+                    elseif not e.hidden and d > hideR then
+                        npcSetHidden(e, true)
+                    end
+                end
+            end
+            if e.dead then N.set[e.m] = nil else keep[#keep + 1] = e end
+        end
+        N.list = keep
+    end
+
+    local function restoreNPCs()
+        for _, e in ipairs(N.list) do
+            if e.hidden and not e.dead then npcSetHidden(e, false) end
+        end
+    end
+
+    local function restoreAll()
+        for i = 1, S.count do
+            if S.hidden[i] and not S.dead[i] then setHidden(i, false) end
+            S.due[i] = 0
+        end
+        restoreNPCs()
+    end
+
+    local function stop()
+        if S.conn then S.conn:Disconnect() S.conn = nil end
+        restoreAll()
+        S.lastFocus = nil
+    end
+
+    local function step(_, dt)
+        if not K.flags.forceOptimize then stop() return end
+        if S.state ~= "ready" then return end
+        dt = dt or 1 / 60
+
+        local hrp = root()
+        local cam = workspace.CurrentCamera
+        local a = hrp and hrp.Position
+        local b = cam and cam.Focus.Position
+        if not a and not b then return end
+
+        local now = os.clock()
+        local showR, hideR = S.radius, S.radius + HYST
+
+        -- Teleport, respawn, radius change or first frame: right now, in
+        -- Stepped (before physics), every chunk within SAFE studs comes back
+        -- so the floor is there before you can fall. Everything else is
+        -- marked due and streams in over the next few frames.
+        local jumped = a ~= nil and (S.lastFocus == nil or (a - S.lastFocus).Magnitude > JUMP)
+        S.lastFocus = a
+        if jumped then
+            for i = 1, S.count do
+                if not S.dead[i] then
+                    if S.hidden[i] and chunkDist(i, a, b) < SAFE then setHidden(i, false) end
+                    S.due[i] = 0
+                end
+            end
+            S.npcTimer = NPC_DT
+        end
+
+        -- Round-robin sized to pass the whole list every SWEEP seconds at any
+        -- framerate. Entries that aren't due yet cost one table read.
+        local n = S.count
+        if n > 0 then
+            local slice = math.min(n, math.max(1, math.ceil(n * dt / SWEEP)))
+            local budget, i = BUDGET, S.cursor
+            for _ = 1, slice do
+                if not S.dead[i] and S.due[i] <= now then
+                    budget = budget - evaluate(i, a, b, now, showR, hideR, budget)
+                end
+                i = i + 1
+                if i > n then i = 1 end
+            end
+            S.cursor = i
+        end
+
+        if S.npcs then
+            S.scanTimer = S.scanTimer + dt
+            if S.scanTimer >= SCAN_DT then S.scanTimer = 0 scanNPCs() end
+            S.npcTimer = S.npcTimer + dt
+            if S.npcTimer >= NPC_DT then S.npcTimer = 0 updateNPCs(a, b, showR, hideR) end
+        end
+    end
+
+    local function start()
+        if S.state == "idle" then
+            task.spawn(function()
+                build()
+                if K.flags.forceOptimize then
+                    notify("Visuals", "Force Optimize: streaming " .. S.count .. " map chunks", 4)
+                end
+            end)
+        end
+        S.lastFocus = nil
+        S.scanTimer = SCAN_DT -- pick NPCs up on the first frame
+        if not S.conn then S.conn = RunService.Stepped:Connect(step) end
+    end
+
+    -----------------------------------------------------------------
+    -- Remove Map Particles: ambient emitters (not on characters, NPCs or
+    -- combat effects in Debris) get Rate = 0 and their live particles
+    -- cleared. Rate, never Enabled - the game reads Enabled on poison smoke,
+    -- torch lights and chakra-point effects and never reads Rate. Map hazard
+    -- visuals (fire, poison smoke) disappear with them.
+    -----------------------------------------------------------------
+    local P = { rates = {}, conn = nil }
+
+    local function ambient(e)
+        local deb = workspace:FindFirstChild("Debris")
+        if deb and e:IsDescendantOf(deb) then return false end
+        local m = e:FindFirstAncestorOfClass("Model")
+        while m do
+            if m:FindFirstChildOfClass("Humanoid") then return false end
+            m = m.Parent and m.Parent:FindFirstAncestorOfClass("Model")
+        end
+        return true
+    end
+
+    local function quiet(e)
+        if P.rates[e] == nil and e.Rate > 0 and ambient(e) then
+            P.rates[e] = e.Rate
+            e.Rate = 0
+            pcall(function() e:Clear() end)
+        end
+    end
+
+    local function particlesOn()
+        for _, d in ipairs(workspace:GetDescendants()) do
+            if d:IsA("ParticleEmitter") then quiet(d) end
+        end
+        if not P.conn then
+            -- Emitters that arrive later: new effects, and anything the
+            -- streamer brings back into range.
+            P.conn = workspace.DescendantAdded:Connect(function(d)
+                if K.flags.removeParticles and d:IsA("ParticleEmitter") then quiet(d) end
+            end)
+        end
+    end
+
+    local function particlesOff()
+        if P.conn then P.conn:Disconnect() P.conn = nil end
+        for e, r in pairs(P.rates) do pcall(function() e.Rate = r end) end
+        P.rates = {}
+    end
+
+    UI.performance.element("Toggle", "Force Optimize", nil, function(v)
+        K.flags.forceOptimize = v.Toggle
+        if v.Toggle then
+            start()
+            notify("Visuals", "Force Optimize enabled - far map streamed out", 3)
+        else
+            stop()
+            notify("Visuals", "Force Optimize disabled - map restored", 3)
+        end
+    end)
+
+    UI.performance.element("Slider", "Render Distance", {
+        default = { min = 200, max = 3000, default = 600 },
+        suffix  = " studs",
+    }, function(v)
+        S.radius = v.Slider
+        S.lastFocus = nil -- full re-evaluation on the next frame
+    end)
+
+    UI.performance.element("Toggle", "Include NPCs", ON, function(v)
+        S.npcs = v.Toggle
+        if not v.Toggle then restoreNPCs() end
+    end)
+
+    UI.performance.element("Label", "Streams out map + NPCs past Render Distance")
+
+    UI.performance.create_line()
+
+    UI.performance.element("Toggle", "Remove Map Particles", nil, function(v)
+        K.flags.removeParticles = v.Toggle
+        if v.Toggle then
+            particlesOn()
+            notify("Visuals", "Map particles removed", 3)
+        else
+            particlesOff()
+            notify("Visuals", "Map particles restored", 3)
+        end
+    end)
+
+    UI.performance.element("Label", "Also hides fire / poison smoke hazards")
 end
 
 
