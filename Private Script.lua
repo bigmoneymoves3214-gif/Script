@@ -2192,6 +2192,7 @@ UI.secCombat         = TabPlayer.new_section("Combat")
 -- UI.parryMoves        = UI.secCombat.new_sector("Moves", "Right")
 -- UI.parryTracker      = UI.secCombat.new_sector("Move Tracker", "Left")
 UI.autoM1            = UI.secCombat.new_sector("Hold to M1", "Left")
+UI.silentAim         = UI.secCombat.new_sector("Silent Aim", "Right")
 
 -- UI.secBuilder        = TabPlayer.new_section("Parry Builder")
 -- UI.builder           = UI.secBuilder.new_sector("Edit Move", "Left")
@@ -2216,6 +2217,7 @@ UI.worldVisuals      = UI.secWorld.new_sector("World Visuals", "Left")
 UI.secTpLocations    = TabTeleports.new_section("Locations")
 UI.boxChakraPoints   = UI.secTpLocations.new_sector("Chakra Points", "Left")
 UI.boxFruits         = UI.secTpLocations.new_sector("Fruits", "Right")
+UI.boxQuest          = UI.secTpLocations.new_sector("Quest", "Right")
 
 UI.secTpPlayers      = TabTeleports.new_section("Players")
 UI.boxTpPlayer       = UI.secTpPlayers.new_sector("Teleport to Player", "Left")
@@ -2266,6 +2268,9 @@ K.flags = {
     noVisualEffects  = false,
     chakraCharge     = false,
     buffChakra       = false,
+    silentAim        = false,
+    noCrowShake      = false,
+    instantKunai     = false,
 }
 
 local function character()
@@ -5201,6 +5206,49 @@ bind(Players.PlayerRemoving:Connect(function()
     end)
 end))
 
+---------------------------------------------------------------------
+-- TELEPORTS :: QUEST
+--
+-- Taking a mission from a village Mission Board makes the server drop a
+-- MissionMarker, tagged with your UserId attribute, inside
+--   workspace.Debris["Mission Locations"][<village>].Spawners.<spawner>
+-- and the mission happens at that spawner. This is the same lookup auto
+-- quest does after the board click, as a standalone button. Every village
+-- folder is searched (not just yours) so a team name that doesn't match the
+-- folder name still works.
+---------------------------------------------------------------------
+do
+    local function findMissionSpot()
+        local debris    = workspace:FindFirstChild("Debris")
+        local locations = debris and debris:FindFirstChild("Mission Locations")
+        if not locations then return nil end
+
+        for _, d in ipairs(locations:GetDescendants()) do
+            if d.Name == "MissionMarker" and tonumber(d:GetAttribute("UserId")) == LP.UserId then
+                local spawner = d.Parent
+                if spawner then
+                    local part = spawner:IsA("BasePart") and spawner or spawner:FindFirstChildWhichIsA("BasePart")
+                    local pos  = part and part.Position or spawner:GetPivot().Position
+                    -- 3 studs up so a ground-level spawner doesn't wedge you in the floor
+                    return CFrame.new(pos + Vector3.new(0, 3, 0))
+                end
+            end
+        end
+        return nil
+    end
+
+    UI.boxQuest.element("Button", "Teleport to Quest", nil, function()
+        local cf = findMissionSpot()
+        if not cf then
+            notify("Teleport", "No active mission - take one from a Mission Board first", 4)
+            return
+        end
+        if safeTeleport(cf) then
+            notify("Teleport", "Went to your mission")
+        end
+    end)
+end
+
 yield(true)
 
 ---------------------------------------------------------------------
@@ -7596,6 +7644,526 @@ UI.autoM1.element("Toggle", "Hold to M1", nil, function(v)
         notify("Combat", "Hold to M1 disabled")
     end
 end)
+
+---------------------------------------------------------------------
+-- SILENT AIM (moves only)
+--
+-- Server-authoritative aim: a move's cast computes v157 =
+-- customRequirement(u1.Hit.Position, skill) (gamescript.txt:2241), runs its
+-- own range checks off u1.Hit (e.g. Kirin, gamescript.txt:2342) AND sends
+-- u153 = u1.Hit.p as startSkill arg3 (gamescript.txt:2565). Rewriting only the
+-- remote arg leaves v157 / the range checks reading the real mouse, so the
+-- server's revalidation sees the mismatch and drops the cast - that is what
+-- bricked casting. The only consistent fix is to fake Mouse.Hit itself so the
+-- whole client pipeline agrees.
+--
+-- Faking Mouse.Hit means hooking the shared instance __index, which fires on
+-- EVERY property read of EVERY instance - and the game reads Mouse.Hit every
+-- frame (character facing, gamescript.txt:15670). The public build pays for a
+-- full player scan on each of those reads; THAT is what tanks FPS, not the
+-- hook existing. So the target is resolved ONCE per frame into cfg.cachedHit
+-- and the __index body is O(1): a pointer compare and a cached-CFrame return.
+-- The hook is installed only while the feature is on and restored when off.
+-- M1s go through CheckMeleeHit with no position, so this is moves only.
+---------------------------------------------------------------------
+do
+    local cfg = {
+        fov         = 120,
+        fov360      = false,
+        maxDistance = 500,
+        teamCheck   = false,
+        whitelist   = {},    -- list of player names to never target
+        showFov     = false,
+        prediction  = false,
+        predX       = 0.165,
+        predY       = 0,
+        fovCircle   = nil,
+        cachedHit   = nil,   -- CFrame, refreshed once per RenderStepped
+        cachedX     = nil,   -- faked Mouse.X for screen-ray moves (Lightning Strike)
+        cachedY     = nil,   -- faked Mouse.Y
+        keyValue    = nil,   -- live keybind state {Key, Type, Active} from the lib
+    }
+    K.silentAim = cfg
+
+    -- Keybind gate. The lib mutates its value table in place (presses, mode
+    -- changes, config loads), so a held reference is always current.
+    --   Always / no key bound -> active whenever Silent Aim is enabled
+    --   Toggle -> each press flips Active;  Hold -> Active only while held
+    local function aimKeyActive()
+        local kv = cfg.keyValue
+        if not kv or not kv.Key or kv.Type == "Always" then return true end
+        return kv.Active == true
+    end
+
+    local function teammate(target)
+        if not cfg.teamCheck then return false end
+        local mine, theirs = LP.Team, target.Team
+        if mine and theirs then
+            if mine == theirs then return true end
+            if mine.Name and theirs.Name and mine.Name == theirs.Name then return true end
+        end
+        return false
+    end
+
+    local function whitelisted(target)
+        return table.find(cfg.whitelist, target.Name) ~= nil
+    end
+
+    -- Closest valid target: by screen distance to crosshair (FOV mode) or by
+    -- world distance (360 mode, ignores where it is on screen). Skips dead,
+    -- teammates (if on) and whitelisted players. maxOverride lets Instant
+    -- Kunai pick within its own range instead of Silent Aim's Max Range.
+    local function pickTarget(maxOverride)
+        local cam = workspace.CurrentCamera
+        local myRoot = root()
+        if not cam or not myRoot then return nil end
+
+        local center  = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+        local myPos   = myRoot.Position
+        local maxDist = maxOverride or cfg.maxDistance
+        local best, bestScore = nil, math.huge
+
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LP and plr.Character and not teammate(plr) and not whitelisted(plr) then
+                local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+                local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
+                if hum and hrp and hum.Health > 0 then
+                    local worldDist = (hrp.Position - myPos).Magnitude
+                    if worldDist <= maxDist then
+                        if cfg.fov360 then
+                            -- closest in the world, anywhere around you
+                            if worldDist < bestScore then
+                                bestScore, best = worldDist, hrp
+                            end
+                        else
+                            local sp, onScreen = cam:WorldToViewportPoint(hrp.Position)
+                            if onScreen then
+                                local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+                                if d <= cfg.fov and d < bestScore then
+                                    bestScore, best = d, hrp
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return best
+    end
+    -- Shared with Instant Kunai so both use the same FOV/360/range/whitelist.
+    K.silentAimPick = pickTarget
+
+    -- Per-frame cache. The full scan runs here once, NOT on every Hit read.
+    local refreshConn = nil
+    local function refresh()
+        -- Key not active (Hold released / Toggle off): clear the cache so the
+        -- hook hands back the real mouse until the key turns it back on.
+        if not K.flags.silentAim or not aimKeyActive() then
+            cfg.cachedHit, cfg.cachedX, cfg.cachedY = nil, nil, nil
+            return
+        end
+        local hrp = pickTarget()
+        if not hrp then
+            cfg.cachedHit, cfg.cachedX, cfg.cachedY = nil, nil, nil
+            return
+        end
+        local pos = hrp.Position
+        if cfg.prediction then
+            local vel = hrp.AssemblyLinearVelocity or hrp.Velocity or Vector3.zero
+            pos = pos + Vector3.new(vel.X * cfg.predX, vel.Y * cfg.predY, vel.Z * cfg.predX)
+        end
+        cfg.cachedHit = CFrame.new(pos)
+
+        -- Screen coords for moves that aim via Mouse.X/Y + ScreenPointToRay
+        -- (e.g. Lightning Strike, gamescript.txt:2349). WorldToScreenPoint
+        -- matches Mouse.X/Y's inset. Only set when the target is on screen, so
+        -- off-screen / behind-camera targets fall back to the real mouse.
+        local cam = workspace.CurrentCamera
+        if cam then
+            local sp, onScreen = cam:WorldToScreenPoint(pos)
+            if onScreen then
+                cfg.cachedX, cfg.cachedY = sp.X, sp.Y
+            else
+                cfg.cachedX, cfg.cachedY = nil, nil
+            end
+        end
+    end
+    local function startRefresh()
+        if refreshConn then return end
+        refreshConn = RunService.RenderStepped:Connect(refresh)
+    end
+    local function stopRefresh()
+        if refreshConn then refreshConn:Disconnect() refreshConn = nil end
+        cfg.cachedHit = nil
+    end
+
+    -- Mouse override. "Hit" covers position-aimed moves; "X"/"Y" cover the ones
+    -- that aim via Mouse.X/Y + ScreenPointToRay (Lightning Strike etc.). Target
+    -- is left alone so NPC and UI clicks keep working. Body is O(1): a pointer
+    -- compare and a cached read. Installed while on, restored when off so there
+    -- is zero __index overhead with the feature disabled.
+    local idx = { on = false, mt = nil, old = nil, mouse = nil }
+    local function installIndex()
+        if idx.on then return true end
+        if not (getrawmetatable and setreadonly) then
+            notify("Combat", "Silent Aim needs getrawmetatable + setreadonly", 6)
+            return false
+        end
+        local ncc = newcclosure or function(f) return f end
+        local ok = pcall(function()
+            idx.mouse = LP:GetMouse()
+            local mt  = getrawmetatable(game)
+            idx.mt    = mt
+            idx.old   = mt.__index
+            setreadonly(mt, false)
+            mt.__index = ncc(function(self, key)
+                if K.flags.silentAim and self == idx.mouse then
+                    if key == "Hit" then
+                        local ch = cfg.cachedHit
+                        if ch then return ch end
+                    elseif key == "X" then
+                        local cx = cfg.cachedX
+                        if cx then return cx end
+                    elseif key == "Y" then
+                        local cy = cfg.cachedY
+                        if cy then return cy end
+                    end
+                end
+                return idx.old(self, key)
+            end)
+            setreadonly(mt, true)
+        end)
+        idx.on = ok
+        return ok
+    end
+    local function uninstallIndex()
+        if not idx.on then return end
+        pcall(function()
+            setreadonly(idx.mt, false)
+            idx.mt.__index = idx.old
+            setreadonly(idx.mt, true)
+        end)
+        idx.on = false
+    end
+
+    -- FOV ring: one Drawing, driven only while the feature and the ring are on.
+    local fovConn = nil
+    local function updateFov()
+        local circle = cfg.fovCircle
+        if not circle then
+            circle = newDrawing("Circle", {
+                Thickness = 1, Filled = false, Transparency = 1,
+                Color = Color3.fromRGB(255, 255, 255),
+            })
+            cfg.fovCircle = circle
+            if not circle then return end
+        end
+        local cam = workspace.CurrentCamera
+        if cam then
+            circle.Position = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+            circle.Radius   = cfg.fov
+            circle.Visible  = cfg.showFov and K.flags.silentAim and not cfg.fov360
+        end
+    end
+    local function startFov()
+        if fovConn then return end
+        fovConn = RunService.RenderStepped:Connect(updateFov)
+    end
+    local function stopFov()
+        if fovConn then fovConn:Disconnect() fovConn = nil end
+        if cfg.fovCircle then cfg.fovCircle.Visible = false end
+    end
+
+    local enableToggle = UI.silentAim.element("Toggle", "Enable Silent Aim", nil, function(v)
+        K.flags.silentAim = v.Toggle
+        if v.Toggle then
+            if not installIndex() then
+                K.flags.silentAim = false
+                return
+            end
+            startRefresh()
+            if cfg.showFov then startFov() end
+            notify("Combat", "Silent Aim enabled")
+        else
+            stopRefresh()
+            uninstallIndex()
+            stopFov()
+            notify("Combat", "Silent Aim disabled")
+        end
+    end)
+
+    -- Aim key. Left-click the [ NONE ] label to bind, right-click it to pick
+    -- the mode (Toggle / Hold / Always). Defaults to Toggle so binding a key
+    -- works immediately; Backspace while binding clears it.
+    local aimKey = enableToggle:add_keybind({ Key = nil, Type = "Toggle", Active = true }, function(v)
+        cfg.keyValue = v
+        if v.Pressed and v.Type == "Toggle" and K.flags.silentAim then
+            notify("Combat", "Silent Aim " .. (v.Active and "ON" or "OFF"), 1.5)
+        end
+    end)
+    -- set_value(nil) without no_cb just fires the callback once, which hands
+    -- us the lib's live value table before any key is ever pressed.
+    if aimKey then aimKey:set_value(nil) end
+
+    UI.silentAim.element("Slider", "Aim FOV", {
+        default = { min = 10, max = 600, default = 120 },
+        suffix  = " px",
+    }, function(v)
+        cfg.fov = v.Slider
+    end)
+
+    UI.silentAim.element("Toggle", "360 FOV", nil, function(v)
+        cfg.fov360 = v.Toggle
+        if cfg.fovCircle then
+            cfg.fovCircle.Visible = cfg.showFov and K.flags.silentAim and not cfg.fov360
+        end
+    end)
+
+    UI.silentAim.element("Slider", "Max Range", {
+        default = { min = 50, max = 1000, default = 500 },
+        suffix  = " studs",
+    }, function(v)
+        cfg.maxDistance = v.Slider
+    end)
+
+    UI.silentAim.element("Toggle", "Team Check", nil, function(v)
+        cfg.teamCheck = v.Toggle
+    end)
+
+    local function whitelistNames()
+        local names = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LP then names[#names + 1] = p.Name end
+        end
+        table.sort(names)
+        return names
+    end
+
+    local wlCombo = UI.silentAim.element("Combo", "Whitelist", {
+        options = whitelistNames(),
+    }, function(v)
+        cfg.whitelist = v.Combo or {}
+    end)
+
+    UI.silentAim.element("Button", "Refresh Whitelist", nil, function()
+        wlCombo:refresh(whitelistNames(), true)
+        notify("Combat", "Whitelist players refreshed", 2)
+    end)
+
+    -- Keep the option list current as people join without pressing refresh.
+    bind(Players.PlayerAdded:Connect(function()
+        pcall(function() wlCombo:refresh(whitelistNames(), true) end)
+    end))
+
+    UI.silentAim.element("Toggle", "Show FOV Circle", nil, function(v)
+        cfg.showFov = v.Toggle
+        if v.Toggle and K.flags.silentAim then startFov() else stopFov() end
+    end)
+
+    UI.silentAim.create_line()
+
+    UI.silentAim.element("Toggle", "Prediction", nil, function(v)
+        cfg.prediction = v.Toggle
+    end)
+
+    UI.silentAim.element("Slider", "Prediction X", {
+        default = { min = 0, max = 100, default = 17 },
+        suffix  = " %",
+    }, function(v)
+        cfg.predX = v.Slider / 100
+    end)
+
+    UI.silentAim.element("Slider", "Prediction Y", {
+        default = { min = 0, max = 100, default = 0 },
+        suffix  = " %",
+    }, function(v)
+        cfg.predY = v.Slider / 100
+    end)
+end
+
+---------------------------------------------------------------------
+-- NO CROW ILLUSION SHAKE
+--
+-- Crow Illusion's camera shake is a Sleitnick CameraShaker at
+-- ReplicatedStorage.Effects.CrowIllusion.EffectsModule.CameraShaker, driven by
+-- :ShakeOnce() and only when the illusion lands on YOU (the module's v11 gate).
+-- The FOV dip, grey tint and screen overlay are separate effects we leave
+-- alone; the shake is killed by swapping that class's ShakeOnce for a no-op
+-- (the effect ignores its return value). require() is cached, so a single swap
+-- covers every future cast; the original is restored when toggled off.
+---------------------------------------------------------------------
+do
+    local CS, origShakeOnce
+
+    local function resolve()
+        if CS then return true end
+        pcall(function()
+            CS = require(RepStorage.Effects.CrowIllusion.EffectsModule.CameraShaker)
+        end)
+        if type(CS) ~= "table" or type(CS.ShakeOnce) ~= "function" then
+            CS = nil
+            return false
+        end
+        origShakeOnce = CS.ShakeOnce
+        return true
+    end
+
+    UI.boxProtection.element("Toggle", "No Crow Illusion Shake", nil, function(v)
+        K.flags.noCrowShake = v.Toggle
+        if v.Toggle then
+            if not resolve() then
+                K.flags.noCrowShake = false
+                notify("Player", "Could not hook Crow Illusion module", 6)
+                return
+            end
+            pcall(function() if setreadonly then setreadonly(CS, false) end end)
+            CS.ShakeOnce = function() return nil end
+            notify("Player", "No Crow Illusion Shake enabled")
+        else
+            if CS and origShakeOnce then
+                pcall(function() if setreadonly then setreadonly(CS, false) end end)
+                CS.ShakeOnce = origShakeOnce
+            end
+            notify("Player", "No Crow Illusion Shake disabled")
+        end
+    end)
+end
+
+---------------------------------------------------------------------
+-- INSTANT KUNAI (Kunai Throw + Multi Kunai Throw)
+--
+-- The throw itself is server-side, but the kunai it spawns is not locked to
+-- the server: it lands in workspace.Debris unanchored, and ~0.1-0.2s later
+-- (end of wind-up) gets a BodyVelocity "DirectionalBV" at 250 studs/s plus
+-- a TouchInterest. The server never calls SetNetworkOwner(nil) on it, so
+-- Roblox hands physics ownership to the nearest player - the thrower - and
+-- the server's Touched on the kunai trusts the touches our client produces.
+-- (Live-verified: isnetworkowner() flips true at the BV, and redirected
+-- kunais land their normal damage.)
+--
+-- So once we own it, we drive it straight through the target: park it 3
+-- studs in front with its own BodyVelocity pointed at them (one physics step
+-- = a genuine physical hit), then next frame sit it inside them and fire the
+-- touch with firetouchinterest. Either one landing is enough; the server
+-- counts one hit per kunai. After those two frames we never write to it
+-- again - the server welds a hit kunai into the target, and writing to it
+-- after that flings their character on our screen. Blocking and hit i-frames
+-- still apply - this removes the flight time, not the server's rules.
+--
+-- Only kunais we OWN that SPAWNED within 12 studs of us are touched, so
+-- someone else's kunai passing by (which can auto-transfer ownership to us)
+-- is never hijacked. Nothing is added to our HRP (BanMe 1E stays clean).
+-- Targeting is Silent Aim's picker (FOV / 360 / whitelist / team) with its
+-- own range (Kunai Max Distance). No target -> the kunai flies normally.
+---------------------------------------------------------------------
+do
+    local conn     = nil
+    local maxRange = 250   -- studs; only targets this close get an instant kunai
+
+    local function waitOwned(part)
+        local t0 = os.clock()
+        while part.Parent and os.clock() - t0 < 1 do
+            local ok, own = pcall(isnetworkowner, part)
+            if ok and own then return true end
+            RunService.Heartbeat:Wait()
+        end
+        return false
+    end
+
+    local function strike(part)
+        if not waitOwned(part) then return end
+        if not K.flags.instantKunai then return end
+
+        local hrp = K.silentAimPick and K.silentAimPick(maxRange)
+        if not hrp or not hrp.Parent then return end
+        local hitPart = hrp.Parent:FindFirstChild("Torso") or hrp
+        local bv      = part:FindFirstChild("DirectionalBV")
+        local home    = part.Parent
+
+        -- On impact the server welds the kunai into the target (the stuck
+        -- kunai). Any CFrame/velocity written to it after that weld reaches
+        -- us drags their whole character on our screen until replication
+        -- snaps them back - a brief client-side fling. So the strike is two
+        -- frames and then hands off for good: the weld needs a full round
+        -- trip to arrive, and the second write is still gated on the kunai
+        -- being a free, unjointed part we own.
+        local function free()
+            if part.Parent ~= home or not hitPart.Parent then return false end
+            if part.AssemblyRootPart ~= part then return false end
+            local ok, own = pcall(isnetworkowner, part)
+            return ok and own
+        end
+
+        local tp  = hitPart.Position
+        local off = tp - part.Position
+        local dir = off.Magnitude > 0.01 and off.Unit or hitPart.CFrame.LookVector
+
+        -- Frame 1: park 3 studs in front, aimed straight in, and let one
+        -- physics step sweep it through the body (a genuine hit).
+        part.CFrame = CFrame.lookAt(tp - dir * 3, tp)
+        if bv then bv.Velocity = dir * 250 end
+        part.AssemblyLinearVelocity = dir * 250
+        RunService.Heartbeat:Wait()
+
+        -- Frame 2: sit it inside them and fire the touch directly as well.
+        -- Its own BodyVelocity carries it out the far side afterwards.
+        if not free() then return end
+        local tp2 = hitPart.Position
+        part.CFrame = CFrame.lookAt(tp2, tp2 + dir)
+        pcall(firetouchinterest, part, hitPart, 0)
+        pcall(firetouchinterest, part, hitPart, 1)
+    end
+
+    -- The thrown part is named after the weapon ("Raijin Kunai") plus
+    -- SmallKunai2/3 for Multi. Nutcracker Raijin and the Daggers are kunai-type
+    -- weapons whose names don't contain "kunai", so match those too.
+    local function isThrownKunai(d)
+        if not d:IsA("BasePart") then return false end
+        local n = d.Name:lower()
+        if n:find("kunai") or n:find("dagger") or n:find("raijin") then return true end
+        local weapon = settingText("CurrentWeapon")
+        return weapon ~= nil and d.Name == weapon
+    end
+
+    local function onDebrisChild(d)
+        if not K.flags.instantKunai then return end
+        if not isThrownKunai(d) then return end
+        local myRoot = root()
+        if not myRoot or (d.Position - myRoot.Position).Magnitude > 12 then return end
+        task.spawn(strike, d)
+    end
+
+    UI.silentAim.create_line()
+
+    UI.silentAim.element("Toggle", "Instant Kunai", nil, function(v)
+        K.flags.instantKunai = v.Toggle
+        if v.Toggle then
+            if not (isnetworkowner and firetouchinterest) then
+                K.flags.instantKunai = false
+                notify("Combat", "Instant Kunai needs isnetworkowner + firetouchinterest", 6)
+                return
+            end
+            local debris = workspace:FindFirstChild("Debris") or workspace:WaitForChild("Debris", 10)
+            if not debris then
+                K.flags.instantKunai = false
+                notify("Combat", "Could not find workspace.Debris", 6)
+                return
+            end
+            if not conn then conn = debris.ChildAdded:Connect(onDebrisChild) end
+            notify("Combat", "Instant Kunai enabled (uses Silent Aim targeting)")
+        else
+            if conn then conn:Disconnect() conn = nil end
+            notify("Combat", "Instant Kunai disabled")
+        end
+    end)
+
+    UI.silentAim.element("Slider", "Kunai Max Distance", {
+        default = { min = 10, max = 1000, default = 250 },
+        suffix  = " studs",
+    }, function(v)
+        maxRange = v.Slider
+    end)
+end
 
 
 yield(true)
