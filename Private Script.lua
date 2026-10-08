@@ -332,8 +332,10 @@ local Atlas = (function()
     -----------------------------------------------------------------
     -- ONE keybind dispatcher.
     -----------------------------------------------------------------
-    local keybinds     = {}   -- [n] = {value = {...}, cb = fn, bind = fn}
+    -- [n] = {value = {Key, Type, Active}, cb, bind, cancel, name, isOn}
+    local keybinds     = {}
     local binding_slot = nil  -- the keybind currently capturing a key
+    lib.keybinds = keybinds   -- read-only view for the Keybind List panel
 
     local function key_name(input)
         return input.KeyCode.Name ~= "Unknown" and input.KeyCode.Name or input.UserInputType.Name
@@ -341,6 +343,21 @@ local Atlas = (function()
 
     track(UserInputService.InputBegan:Connect(function(input, processed)
         if binding_slot then
+            -- Only keyboard keys and the right / middle mouse buttons can
+            -- become a bind. Left clicks are ignored while binding: the click
+            -- that opened the binder arrives here too, and used to bind
+            -- itself as MouseButton1. Escape cancels.
+            local t = input.UserInputType
+            if t == Enum.UserInputType.Keyboard then
+                if input.KeyCode == Enum.KeyCode.Escape then
+                    local slot = binding_slot
+                    binding_slot = nil
+                    slot.cancel()
+                    return
+                end
+            elseif t ~= Enum.UserInputType.MouseButton2 and t ~= Enum.UserInputType.MouseButton3 then
+                return
+            end
             local slot = binding_slot
             binding_slot = nil
             slot.bind(key_name(input))
@@ -1264,19 +1281,29 @@ local Atlas = (function()
                                         store[extra_flag] = v
                                         pcall(key_callback, v)
                                     end,
+                                    name  = text,
+                                    -- A getter, not a copy: set_value replaces the
+                                    -- toggle's table on config load.
+                                    isOn  = function() return value.Toggle == true end,
                                 }
+
+                                local function showKey()
+                                    Keybind.Text = "[ " .. (extra_value.Key or "NONE"):upper() .. " ]"
+                                    Keybind.Size = UDim2.new(0, lib:text_size(Keybind.Text, 14).X + 3, 0, 20)
+                                end
 
                                 slot.bind = function(pressed)
                                     if pressed == "Backspace" then
                                         extra_value.Key = nil
-                                        Keybind.Text    = "[ NONE ]"
                                     else
                                         extra_value.Key = pressed
-                                        Keybind.Text    = "[ " .. pressed:upper() .. " ]"
                                     end
-                                    Keybind.Size = UDim2.new(0, lib:text_size(Keybind.Text, 14).X + 3, 0, 20)
+                                    showKey()
                                     slot.cb(extra_value)
                                 end
+
+                                -- Abandon a pending bind: put the current key back on the label.
+                                slot.cancel = showKey
 
                                 keybinds[#keybinds + 1] = slot
                                 store[extra_flag] = extra_value
@@ -1306,7 +1333,9 @@ local Atlas = (function()
                                     track(TypeButton.MouseButton1Down:Connect(function()
                                         KeybindFrame.Visible = false
                                         extra_value.Type     = mode
-                                        extra_value.Active   = (mode ~= "Hold")
+                                        -- Toggle starts OFF (press to turn it on), Hold is off
+                                        -- until held; only Always is active without the key.
+                                        extra_value.Active   = (mode == "Always")
 
                                         for _, other in ipairs(KeybindFrame:GetChildren()) do
                                             if other:IsA("TextButton") then
@@ -1318,11 +1347,18 @@ local Atlas = (function()
                                 end
 
                                 track(Keybind.MouseButton1Down:Connect(function()
-                                    if binding_slot then return end
+                                    -- Clicking the label that's already waiting cancels it.
+                                    if binding_slot == slot then
+                                        binding_slot = nil
+                                        slot.cancel()
+                                        return
+                                    end
+                                    -- Another bind left waiting would otherwise swallow this
+                                    -- click AND take the next key press - hand over instead.
+                                    if binding_slot then binding_slot.cancel() end
+                                    binding_slot = slot
                                     Keybind.Text = "[ ... ]"
                                     Keybind.Size = UDim2.new(0, lib:text_size("[ ... ]", 14).X + 3, 0, 20)
-                                    -- Defer one frame: this very click would otherwise be captured.
-                                    task.defer(function() binding_slot = slot end)
                                 end))
 
                                 track(Keybind.MouseButton2Down:Connect(function()
@@ -2193,6 +2229,7 @@ UI.secCombat         = TabPlayer.new_section("Combat")
 -- UI.parryTracker      = UI.secCombat.new_sector("Move Tracker", "Left")
 UI.autoM1            = UI.secCombat.new_sector("Hold to M1", "Left")
 UI.silentAim         = UI.secCombat.new_sector("Silent Aim", "Right")
+UI.combatUtil        = UI.secCombat.new_sector("Utility", "Left")
 
 -- UI.secBuilder        = TabPlayer.new_section("Parry Builder")
 -- UI.builder           = UI.secBuilder.new_sector("Edit Move", "Left")
@@ -2274,6 +2311,9 @@ K.flags = {
     instantKunai     = false,
     forceOptimize    = false,
     removeParticles  = false,
+    antiKnockback    = false,
+    keybindList      = false,
+    autoGenjutsu     = false,
 }
 
 local function character()
@@ -2666,6 +2706,70 @@ UI.boxProtection.element("Toggle", "No Fall Damage", nil, function(v)
     if v.Toggle then installFeatureHook() end
     notify("Player", "No Fall Damage " .. (v.Toggle and "enabled" or "disabled"))
 end)
+
+---------------------------------------------------------------------
+-- ANTI KNOCKBACK
+--
+-- Every knockback is a BodyVelocity named "KnockbackBV" that the server puts
+-- in the victim's HumanoidRootPart, or tells the victim's client to make via
+-- "CreateVelocity" (GameManager.createBodyVelocity). Our client simulates
+-- our own character, so a KnockbackBV that never applies force here means
+-- no knockback.
+--
+-- MaxForce is zeroed the moment it appears, so not even one physics step of
+-- push gets through, then it's destroyed. Destroying matters: the game sets
+-- Velocity after parenting, and some calls start a per-frame obstacle loop
+-- that keeps restoring MaxForce while the mover is parented - removing it
+-- ends that loop. KnockbackBV is on the game's own allowed-mover list (the
+-- BanMe 1E HRP check), and nothing is ever added by us.
+---------------------------------------------------------------------
+do
+    local conns = {}
+
+    local function neutralize(child)
+        if child.Name ~= "KnockbackBV" or not child:IsA("BodyVelocity") then return end
+        -- Angelic Rescue launches you out of the void with a KnockbackBV too
+        -- (GameManager.angelicRescue), but its force is vertical-only
+        -- (MaxForce 0, 1e7, 0); every real knockback pushes on all axes.
+        -- Cancelling it would drop you back into the void - leave it alone.
+        local mf = child.MaxForce
+        if mf.X == 0 and mf.Z == 0 and mf.Y > 0 then return end
+        pcall(function()
+            child.MaxForce = Vector3.zero
+            child.Velocity = Vector3.zero
+        end)
+        task.defer(function() pcall(child.Destroy, child) end)
+    end
+
+    local function watch(char)
+        local hrp = char:WaitForChild("HumanoidRootPart", 10)
+        if not hrp or not K.flags.antiKnockback then return end
+        for _, ch in ipairs(hrp:GetChildren()) do neutralize(ch) end
+        if conns.child then conns.child:Disconnect() end
+        conns.child = hrp.ChildAdded:Connect(function(ch)
+            if K.flags.antiKnockback then neutralize(ch) end
+        end)
+    end
+
+    local function disconnectAll()
+        for k, c in pairs(conns) do
+            c:Disconnect()
+            conns[k] = nil
+        end
+    end
+
+    UI.boxProtection.element("Toggle", "Anti Knockback", nil, function(v)
+        K.flags.antiKnockback = v.Toggle
+        disconnectAll()
+        if v.Toggle then
+            if LP.Character then task.spawn(watch, LP.Character) end
+            conns.char = LP.CharacterAdded:Connect(watch)
+            notify("Player", "Anti Knockback enabled")
+        else
+            notify("Player", "Anti Knockback disabled")
+        end
+    end)
+end
 
 ---------------------------------------------------------------------
 -- ANTI VOID
@@ -5432,6 +5536,192 @@ local function makePanel(opts)
     return panel
 end
 
+---------------------------------------------------------------------
+-- KEYBIND LIST
+--
+-- Small draggable panel listing every bound keybind and whether its feature
+-- is on right now. It reads the menu library's own registry (Atlas.keybinds)
+-- so it can never drift from what the binds actually do: a feature is ON
+-- when its toggle is enabled and, for Toggle / Hold binds, the key currently
+-- has it active.
+---------------------------------------------------------------------
+do
+    local TextService = game:GetService("TextService")
+    local UIS         = K.Services.UserInputService
+
+    local GREY   = Color3.fromRGB(58, 58, 66)
+    local PURPLE = Color3.fromRGB(152, 84, 255)
+    local W_MIN, ROW_H, HEAD_H, FONT_SIZE = 150, 18, 26, 13
+
+    local KB = { frame = nil, list = nil, sig = nil, running = false }
+
+    local function build()
+        local f = Instance.new("Frame")
+        f.Name             = "KeybindList"
+        f.Size             = UDim2.new(0, W_MIN, 0, HEAD_H + 8)
+        f.Position         = UDim2.new(0, 20, 0.4, 0)
+        f.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+        f.BorderSizePixel  = 0
+        f.Active           = true
+        f.ZIndex           = 2
+        f.Parent           = hudRoot()
+
+        local stroke = Instance.new("UIStroke")
+        stroke.Color     = GREY
+        stroke.Thickness = 1
+        stroke.Parent    = f
+
+        -- grey top bar, purple accent bar right under it
+        local grey = Instance.new("Frame")
+        grey.Size             = UDim2.new(1, 0, 0, 2)
+        grey.BackgroundColor3 = GREY
+        grey.BorderSizePixel  = 0
+        grey.ZIndex           = 3
+        grey.Parent           = f
+
+        local purple = Instance.new("Frame")
+        purple.Position         = UDim2.new(0, 0, 0, 2)
+        purple.Size             = UDim2.new(1, 0, 0, 2)
+        purple.BackgroundColor3 = PURPLE
+        purple.BorderSizePixel  = 0
+        purple.ZIndex           = 3
+        purple.Parent           = f
+
+        local title = Instance.new("TextLabel")
+        title.BackgroundTransparency = 1
+        title.Position       = UDim2.new(0, 8, 0, 4)
+        title.Size           = UDim2.new(1, -16, 0, HEAD_H - 4)
+        title.Font           = Enum.Font.GothamBold
+        title.TextSize       = 14
+        title.TextColor3     = Color3.fromRGB(255, 255, 255)
+        title.TextXAlignment = Enum.TextXAlignment.Left
+        title.Text           = "Keybinds"
+        title.ZIndex         = 3
+        title.Parent         = f
+
+        local list = Instance.new("Frame")
+        list.BackgroundTransparency = 1
+        list.Position = UDim2.new(0, 8, 0, HEAD_H)
+        list.Size     = UDim2.new(1, -16, 1, -(HEAD_H + 4))
+        list.ZIndex   = 3
+        list.Parent   = f
+
+        local layout = Instance.new("UIListLayout")
+        layout.SortOrder = Enum.SortOrder.LayoutOrder
+        layout.Parent    = list
+
+        -- Drag from anywhere on the panel. Release is watched globally so a
+        -- fast drag that leaves the panel can't get stuck "held".
+        local dragging, dragStart, startPos = false, nil, nil
+        bind(f.InputBegan:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+            dragging, dragStart, startPos = true, input.Position, f.Position
+        end))
+        bind(UIS.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+        end))
+        bind(UIS.InputChanged:Connect(function(input)
+            if not dragging or input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+            local d = input.Position - dragStart
+            f.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                                   startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end))
+
+        KB.frame, KB.list, KB.sig = f, list, nil
+    end
+
+    local function esc(s)
+        return (s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+    end
+
+    -- Bound keys only; "Enable Silent Aim" reads as "Silent Aim".
+    local function entries()
+        local out = {}
+        for _, slot in ipairs(Atlas.keybinds or {}) do
+            local v = slot.value
+            if v.Key and slot.name then
+                local enabled = slot.isOn and slot.isOn() or false
+                out[#out + 1] = {
+                    key  = v.Key,
+                    name = (slot.name:gsub("^Enable ", "")),
+                    on   = enabled and (v.Type == "Always" or v.Active == true),
+                }
+            end
+        end
+        return out
+    end
+
+    local function addRow(order, rich, plain, color)
+        local row = Instance.new("TextLabel")
+        row.BackgroundTransparency = 1
+        row.Size           = UDim2.new(1, 0, 0, ROW_H)
+        row.Font           = Enum.Font.Gotham
+        row.TextSize       = FONT_SIZE
+        row.TextColor3     = color or Color3.fromRGB(230, 230, 230)
+        row.TextXAlignment = Enum.TextXAlignment.Left
+        row.RichText       = true
+        row.Text           = rich
+        row.LayoutOrder    = order
+        row.ZIndex         = 3
+        row.Parent         = KB.list
+        local size = TextService:GetTextSize(plain, FONT_SIZE, Enum.Font.Gotham, Vector2.new(1000, ROW_H))
+        return size.X
+    end
+
+    local function render()
+        local list = entries()
+        local parts = {}
+        for i, e in ipairs(list) do parts[i] = e.key .. "|" .. e.name .. "|" .. tostring(e.on) end
+        local sig = table.concat(parts, ";")
+        if sig == KB.sig then return end -- nothing changed, nothing rebuilt
+        KB.sig = sig
+
+        for _, ch in ipairs(KB.list:GetChildren()) do
+            if ch:IsA("TextLabel") then ch:Destroy() end
+        end
+
+        local widest = 0
+        if #list == 0 then
+            widest = addRow(1, "No keybinds set", "No keybinds set", Color3.fromRGB(140, 140, 140))
+        else
+            for i, e in ipairs(list) do
+                local state = e.on and '<font color="#22c55e">ON</font>' or '<font color="#ef4444">OFF</font>'
+                local rich  = "[" .. esc(e.key) .. "] | " .. esc(e.name) .. ": " .. state
+                local plain = "[" .. e.key .. "] | " .. e.name .. ": " .. (e.on and "ON" or "OFF")
+                widest = math.max(widest, addRow(i, rich, plain))
+            end
+        end
+
+        local rows = math.max(#list, 1)
+        KB.frame.Size = UDim2.new(0, math.max(W_MIN, widest + 20), 0, HEAD_H + rows * ROW_H + 6)
+    end
+
+    local function start()
+        if not KB.frame or not KB.frame.Parent then build() end
+        KB.frame.Visible = true
+        KB.sig = nil
+        if KB.running then return end
+        KB.running = true
+        task.spawn(function()
+            while K.flags.keybindList do
+                pcall(render)
+                task.wait(0.15)
+            end
+            KB.running = false
+            if KB.frame then KB.frame.Visible = false end
+        end)
+    end
+
+    UI.boxMenu.element("Toggle", "Keybind List", nil, function(v)
+        K.flags.keybindList = v.Toggle
+        if v.Toggle then
+            start()
+        elseif KB.frame then
+            KB.frame.Visible = false
+        end
+    end)
+end
+
 yield()
 
 ---------------------------------------------------------------------
@@ -7649,6 +7939,195 @@ UI.autoM1.element("Toggle", "Hold to M1", nil, function(v)
 end)
 
 ---------------------------------------------------------------------
+-- AUTO GENJUTSU RELEASE
+--
+-- Casts Genjutsu Release the moment you're caught by Fog Illusion, Feather
+-- Genjutsu or Scrambled Mind. Every trigger is aimed at YOU, so someone else
+-- getting caught nearby never fires it:
+--   Fog Illusion   - server sets a "FogIllusion" attribute on your character
+--   Scrambled Mind - server sets a "ScrambledMind" attribute on your character
+--   Feather        - server sends your client "FeatherGenjutsu" (its effect
+--                    plays on your own HRP) and "StopFeatherGenjutsu" after
+--
+-- The cast goes through the game's own activateSkill(nil, "Genjutsu
+-- Release") - the same form the game uses for Kotoamatsukami - so the
+-- animation, chakra cost, the server cooldown check and the startSkill
+-- arguments all stay consistent. (Passing "MouseButton1" there would cast
+-- your held weapon's M1 skill instead.) Genjutsu Release has BypassStun and
+-- BypassOccupied, so it goes through while stunned.
+--
+-- Ownership is checked with the game's own GameManager:hasSkill first, so
+-- it never plays the animation for a skill you don't have. If you're
+-- mid-cast when it lands, it retries every 0.4s while the genjutsu lasts
+-- (max ~4s); while the skill is on cooldown it doesn't even ask the server.
+-- (Live-verified: activateSkill and the ownership check resolve from the
+-- running client; Cooldowns entries are last-used timestamps, not flags.)
+---------------------------------------------------------------------
+do
+    local SKILL = "Genjutsu Release"
+    local AG = {
+        fn = nil, gm = nil, dataIdx = nil, script = nil, state = nil, select = nil,
+        featherUntil = 0, busy = false, conns = {}, charConns = {},
+    }
+
+    -- activateSkill is a global in the game LocalScript's environment. The
+    -- script restarts on respawn, so only accept the copy belonging to the
+    -- live script (an old one can linger in the GC). From its upvalues pick
+    -- out GameManager and the slot holding your data for the ownership check.
+    local function resolve()
+        if AG.fn and AG.script and AG.script.Parent then return true end
+        AG.fn, AG.gm, AG.dataIdx, AG.script, AG.state, AG.select = nil, nil, nil, nil, nil, nil
+        pcall(function()
+            for _, f in ipairs(getgc(false)) do
+                if type(f) == "function" then
+                    local named, name = pcall(debug.info, f, "n")
+                    if named and name == "activateSkill" then
+                        local env = getfenv(f)
+                        local s = rawget(env, "script")
+                        local fn = rawget(env, "activateSkill")
+                        if fn and s and s:IsDescendantOf(LP) then
+                            AG.fn, AG.script = fn, s
+                            break
+                        end
+                    end
+                end
+            end
+            if not AG.fn then return end
+            for i, uv in ipairs(debug.getupvalues(AG.fn)) do
+                if type(uv) == "table" then
+                    if type(rawget(uv, "hasSkill")) == "function" then
+                        AG.gm = uv
+                    elseif rawget(uv, "CurrentWeapon") ~= nil and rawget(uv, "Traits") ~= nil then
+                        AG.dataIdx = i
+                    elseif rawget(uv, "skillInUse") ~= nil and rawget(uv, "Settings") ~= nil then
+                        AG.state = uv -- the game's client state (Selected, Occupied, ...)
+                    end
+                elseif type(uv) == "function" then
+                    local ok, n = pcall(debug.info, uv, "n")
+                    if ok and n == "selectNewItem" then AG.select = uv end
+                end
+            end
+        end)
+        return AG.fn ~= nil
+    end
+
+    -- The game only casts a skill while you're holding something (it checks
+    -- Selected ~= ""), and Genjutsu Release has no bypass. With empty hands,
+    -- press the skill's own slot through the game's selectNewItem - how it's
+    -- normally cast, and the game unselects it after - else your weapon.
+    -- (Live-verified: empty hands -> slot selected -> cast -> hands empty.)
+    local function ensureSelected()
+        local st = AG.state
+        if not st or st.Selected ~= "" or not AG.select or not AG.dataIdx then return end
+        local ok, data = pcall(debug.getupvalue, AG.fn, AG.dataIdx)
+        if not ok or type(data) ~= "table" then return end
+        pcall(AG.select, data, SKILL)
+        if st.Selected == "" and data.CurrentWeapon then
+            pcall(AG.select, data, data.CurrentWeapon)
+        end
+    end
+
+    -- Your data is a ref upvalue the game reassigns, so it's re-read each
+    -- time. If ownership can't be checked, let the game decide.
+    local function owns()
+        if not AG.gm or not AG.dataIdx then return true end
+        local ok, data = pcall(debug.getupvalue, AG.fn, AG.dataIdx)
+        if not ok or type(data) ~= "table" then return true end
+        local okh, has = pcall(AG.gm.hasSkill, AG.gm, data, SKILL)
+        return not okh or (has and true or false)
+    end
+
+    -- ReplicatedStorage.Cooldowns[you][skill] is a NumberValue holding the
+    -- server time the skill was LAST USED, and it is never removed - so the
+    -- entry existing means nothing; compare the time since then against the
+    -- cooldown. The game's own getCooldown (what its cooldown UI uses) is
+    -- asked for the length, falling back to the base 30s.
+    local function onCooldown()
+        local all  = RepStorage:FindFirstChild("Cooldowns")
+        local mine = all and all:FindFirstChild(LP.Name)
+        local used = mine and mine:FindFirstChild(SKILL)
+        if not used then return false end
+        local cd = 30
+        if AG.gm then
+            local ok, v = pcall(AG.gm.getCooldown, AG.gm, LP.Character, SKILL, mySettings())
+            if ok and type(v) == "number" then cd = v end
+        end
+        return workspace:GetServerTimeNow() - used.Value < cd + 0.25
+    end
+
+    local function caught()
+        local c = LP.Character
+        if not c then return false end
+        if os.clock() < AG.featherUntil then return true end
+        return (c:GetAttribute("FogIllusion") or c:GetAttribute("ScrambledMind")) and true or false
+    end
+
+    local function release()
+        if AG.busy or not K.flags.autoGenjutsu then return end
+        AG.busy = true
+        task.spawn(function()
+            local deadline = os.clock() + 4
+            while K.flags.autoGenjutsu and os.clock() < deadline and caught() do
+                if not onCooldown() and resolve() and owns() then
+                    ensureSelected()
+                    pcall(AG.fn, nil, SKILL)
+                end
+                task.wait(0.4)
+            end
+            AG.busy = false
+        end)
+    end
+
+    local function watchCharacter(char)
+        for _, c in ipairs(AG.charConns) do c:Disconnect() end
+        AG.charConns = {}
+        if not char then return end
+        for _, attr in ipairs({ "FogIllusion", "ScrambledMind" }) do
+            AG.charConns[#AG.charConns + 1] = char:GetAttributeChangedSignal(attr):Connect(function()
+                if char:GetAttribute(attr) then release() end
+            end)
+        end
+        if caught() then release() end -- already caught when this started
+    end
+
+    local function stop()
+        for _, c in ipairs(AG.conns) do c:Disconnect() end
+        for _, c in ipairs(AG.charConns) do c:Disconnect() end
+        AG.conns, AG.charConns = {}, {}
+        AG.featherUntil = 0
+    end
+
+    UI.combatUtil.element("Toggle", "Auto Genjutsu Release", nil, function(v)
+        K.flags.autoGenjutsu = v.Toggle
+        stop()
+        if not v.Toggle then
+            notify("Combat", "Auto Genjutsu Release disabled")
+            return
+        end
+
+        local dataEvent = RepStorage:WaitForChild("Events"):WaitForChild("DataEvent")
+        -- An extra listener: it runs alongside the game's own handler.
+        AG.conns[#AG.conns + 1] = dataEvent.OnClientEvent:Connect(function(kind)
+            if kind == "FeatherGenjutsu" then
+                AG.featherUntil = os.clock() + 15 -- cleared early by the stop event
+                release()
+            elseif kind == "StopFeatherGenjutsu" then
+                AG.featherUntil = 0
+            end
+        end)
+        AG.conns[#AG.conns + 1] = LP.CharacterAdded:Connect(watchCharacter)
+        watchCharacter(LP.Character)
+
+        if resolve() then
+            notify("Combat", owns() and "Auto Genjutsu Release enabled"
+                or "Auto Genjutsu Release enabled - but you don't own Genjutsu Release", 4)
+        else
+            notify("Combat", "Auto Genjutsu Release enabled (game skill function not found yet)", 4)
+        end
+    end)
+end
+
+---------------------------------------------------------------------
 -- SILENT AIM (moves only)
 --
 -- Server-authoritative aim: a move's cast computes v157 =
@@ -7983,18 +8462,41 @@ do
         end
     end)
 
-    -- Aim key. Left-click the [ NONE ] label to bind, right-click it to pick
-    -- the mode (Toggle / Hold / Always). Defaults to Toggle so binding a key
-    -- works immediately; Backspace while binding clears it.
-    local aimKey = enableToggle:add_keybind({ Key = nil, Type = "Toggle", Active = true }, function(v)
+    -- Aim key: left-click the [ NONE ] label on "Enable Silent Aim", then
+    -- press a key (right / middle mouse work too; Backspace clears it, Escape
+    -- or clicking the label again cancels). The mode is the "Aim Key Mode"
+    -- dropdown below:
+    --   Toggle - press to turn aiming on, press again to turn it off
+    --   Hold   - aims only while the key is held
+    -- With no key bound, Silent Aim aims whenever it's enabled.
+    local lastKey = nil
+    local aimKey = enableToggle:add_keybind({ Key = nil, Type = "Toggle", Active = false }, function(v)
         cfg.keyValue = v
-        if v.Pressed and v.Type == "Toggle" and K.flags.silentAim then
-            notify("Combat", "Silent Aim " .. (v.Active and "ON" or "OFF"), 1.5)
+        if v.Pressed then
+            if v.Type == "Toggle" and K.flags.silentAim then
+                notify("Combat", "Silent Aim " .. (v.Active and "ON" or "OFF"), 1.5)
+            end
+        elseif v.Key ~= lastKey then
+            lastKey = v.Key
+            if v.Key then
+                notify("Combat", "Aim key set to " .. v.Key .. " - "
+                    .. (v.Type == "Hold" and "hold it to aim" or "press it to turn aiming on/off"), 4)
+            end
         end
     end)
     -- set_value(nil) without no_cb just fires the callback once, which hands
     -- us the lib's live value table before any key is ever pressed.
     if aimKey then aimKey:set_value(nil) end
+
+    UI.silentAim.element("Dropdown", "Aim Key Mode", {
+        options = { "Toggle", "Hold" },
+        default = { Dropdown = "Toggle" },
+    }, function(v)
+        if not aimKey then return end
+        local kv = cfg.keyValue
+        -- Either mode starts with aiming off until the key is used.
+        aimKey:set_value({ Key = kv and kv.Key, Type = v.Dropdown, Active = false })
+    end)
 
     UI.silentAim.element("Slider", "Aim FOV", {
         default = { min = 10, max = 600, default = 120 },
