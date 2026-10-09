@@ -2314,6 +2314,9 @@ K.flags = {
     antiKnockback    = false,
     keybindList      = false,
     autoGenjutsu     = false,
+    antiScramble     = false,
+    antiAttach       = false,
+    autoTotsuka      = false,
 }
 
 local function character()
@@ -7976,7 +7979,8 @@ do
     -- out GameManager and the slot holding your data for the ownership check.
     local function resolve()
         if AG.fn and AG.script and AG.script.Parent then return true end
-        AG.fn, AG.gm, AG.dataIdx, AG.script, AG.state, AG.select = nil, nil, nil, nil, nil, nil
+        AG.fn, AG.gm, AG.dataIdx, AG.script, AG.state, AG.select, AG.skills =
+            nil, nil, nil, nil, nil, nil, nil
         pcall(function()
             for _, f in ipairs(getgc(false)) do
                 if type(f) == "function" then
@@ -7987,6 +7991,7 @@ do
                         local fn = rawget(env, "activateSkill")
                         if fn and s and s:IsDescendantOf(LP) then
                             AG.fn, AG.script = fn, s
+                            AG.skills = rawget(env, "skillsModule")
                             break
                         end
                     end
@@ -8016,24 +8021,41 @@ do
     -- press the skill's own slot through the game's selectNewItem - how it's
     -- normally cast, and the game unselects it after - else your weapon.
     -- (Live-verified: empty hands -> slot selected -> cast -> hands empty.)
-    local function ensureSelected()
+    local function ensureSelected(skill)
         local st = AG.state
         if not st or st.Selected ~= "" or not AG.select or not AG.dataIdx then return end
         local ok, data = pcall(debug.getupvalue, AG.fn, AG.dataIdx)
         if not ok or type(data) ~= "table" then return end
-        pcall(AG.select, data, SKILL)
+        pcall(AG.select, data, skill)
         if st.Selected == "" and data.CurrentWeapon then
             pcall(AG.select, data, data.CurrentWeapon)
         end
     end
 
+    -- Is this skill the active awakening's M1 / M2? Awakening moves
+    -- (Amaterasu, Susanoo Strike, ...) are NOT in UnlockedSkills, so hasSkill
+    -- returns false for them - live-verified: hasSkill "Susanoo Strike" and
+    -- "Amaterasu" are both false while hasSkill "Itachi's Eternal Mangekyo"
+    -- is true. They are castable only while that awakening is active.
+    local function fromAwakening(skill)
+        local st, sk = AG.state, AG.skills
+        if not st or not sk then return false end
+        local aw = st.Settings and st.Settings.Awakened and st.Settings.Awakened.Value
+        local def = aw and aw ~= "" and sk[aw]
+        if not def then return false end
+        return def.MouseButton1 == skill or def.MouseButton2 == skill
+            or def["C + M1"] == skill or def["C + M2"] == skill
+    end
+    K.skillFromAwakening = fromAwakening
+
     -- Your data is a ref upvalue the game reassigns, so it's re-read each
     -- time. If ownership can't be checked, let the game decide.
-    local function owns()
+    local function owns(skill)
+        if fromAwakening(skill) then return true end
         if not AG.gm or not AG.dataIdx then return true end
         local ok, data = pcall(debug.getupvalue, AG.fn, AG.dataIdx)
         if not ok or type(data) ~= "table" then return true end
-        local okh, has = pcall(AG.gm.hasSkill, AG.gm, data, SKILL)
+        local okh, has = pcall(AG.gm.hasSkill, AG.gm, data, skill)
         return not okh or (has and true or false)
     end
 
@@ -8042,24 +8064,40 @@ do
     -- entry existing means nothing; compare the time since then against the
     -- cooldown. The game's own getCooldown (what its cooldown UI uses) is
     -- asked for the length, falling back to the base 30s.
-    local function onCooldown()
+    local function onCooldown(skill, fallback)
         local all  = RepStorage:FindFirstChild("Cooldowns")
         local mine = all and all:FindFirstChild(LP.Name)
-        local used = mine and mine:FindFirstChild(SKILL)
+        local used = mine and mine:FindFirstChild(skill)
         if not used then return false end
-        local cd = 30
+        local cd = fallback or 30
         if AG.gm then
-            local ok, v = pcall(AG.gm.getCooldown, AG.gm, LP.Character, SKILL, mySettings())
+            local ok, v = pcall(AG.gm.getCooldown, AG.gm, LP.Character, skill, mySettings())
             if ok and type(v) == "number" then cd = v end
         end
         return workspace:GetServerTimeNow() - used.Value < cd + 0.25
+    end
+
+    -- Shared skill caster: resolve, ownership, hand-selection, then the
+    -- game's own activateSkill. Other features (Auto Totsuka Blade) use this
+    -- instead of duplicating the resolver.
+    K.castSkill = function(skill, cdFallback)
+        if not resolve() or not owns(skill) then return false end
+        if onCooldown(skill, cdFallback) then return false end
+        ensureSelected(skill)
+        return pcall(AG.fn, nil, skill)
+    end
+    K.skillOnCooldown = function(skill, cdFallback)
+        return resolve() and onCooldown(skill, cdFallback) or false
     end
 
     local function caught()
         local c = LP.Character
         if not c then return false end
         if os.clock() < AG.featherUntil then return true end
-        return (c:GetAttribute("FogIllusion") or c:GetAttribute("ScrambledMind")) and true or false
+        if c:GetAttribute("FogIllusion") then return true end
+        -- With Anti Scrambled Mind on, Scrambled Mind is already neutralised;
+        -- keep the 30s cooldown for the genjutsus that need it.
+        return c:GetAttribute("ScrambledMind") and not K.flags.antiScramble or false
     end
 
     local function release()
@@ -8068,8 +8106,8 @@ do
         task.spawn(function()
             local deadline = os.clock() + 4
             while K.flags.autoGenjutsu and os.clock() < deadline and caught() do
-                if not onCooldown() and resolve() and owns() then
-                    ensureSelected()
+                if not onCooldown(SKILL) and resolve() and owns(SKILL) then
+                    ensureSelected(SKILL)
                     pcall(AG.fn, nil, SKILL)
                 end
                 task.wait(0.4)
@@ -8084,6 +8122,7 @@ do
         if not char then return end
         for _, attr in ipairs({ "FogIllusion", "ScrambledMind" }) do
             AG.charConns[#AG.charConns + 1] = char:GetAttributeChangedSignal(attr):Connect(function()
+                if attr == "ScrambledMind" and K.flags.antiScramble then return end
                 if char:GetAttribute(attr) then release() end
             end)
         end
@@ -8119,11 +8158,405 @@ do
         watchCharacter(LP.Character)
 
         if resolve() then
-            notify("Combat", owns() and "Auto Genjutsu Release enabled"
+            notify("Combat", owns(SKILL) and "Auto Genjutsu Release enabled"
                 or "Auto Genjutsu Release enabled - but you don't own Genjutsu Release", 4)
         else
             notify("Combat", "Auto Genjutsu Release enabled (game skill function not found yet)", 4)
         end
+    end)
+end
+
+---------------------------------------------------------------------
+-- ANTI SCRAMBLED MIND
+--
+-- Scrambled Mind is only a "ScrambledMind" attribute the server puts on your
+-- character. ALL of the scrambling happens in the game's own client input
+-- handler (onKeyDown, gamescript.txt:6646-6687 and 8895-8924), which reads
+-- that attribute on every key press to swap M1<->F, M2<->Q, W<->S, A<->D and
+-- R<->Q. Clearing it on our client the moment it arrives means every one of
+-- those reads finds nothing and the controls stay normal.
+--
+-- Local only - client attribute writes don't replicate - so the server-side
+-- genjutsu simply runs out; if the server applies it again it's cleared
+-- again. Clearing re-fires the changed signal once, which then finds the
+-- attribute already gone, so there's no loop.
+---------------------------------------------------------------------
+do
+    local ATTR  = "ScrambledMind"
+    local conns = {}
+
+    local function clear(char)
+        if char and char:GetAttribute(ATTR) then
+            pcall(function() char:SetAttribute(ATTR, nil) end)
+        end
+    end
+
+    local function watch(char)
+        if conns.attr then conns.attr:Disconnect() conns.attr = nil end
+        if not char then return end
+        clear(char) -- already scrambled when this started
+        conns.attr = char:GetAttributeChangedSignal(ATTR):Connect(function()
+            if K.flags.antiScramble then clear(char) end
+        end)
+    end
+
+    UI.combatUtil.element("Toggle", "Anti Scrambled Mind", nil, function(v)
+        K.flags.antiScramble = v.Toggle
+        for k, c in pairs(conns) do
+            c:Disconnect()
+            conns[k] = nil
+        end
+        if v.Toggle then
+            watch(LP.Character)
+            conns.char = LP.CharacterAdded:Connect(watch)
+            notify("Combat", "Anti Scrambled Mind enabled")
+        else
+            notify("Combat", "Anti Scrambled Mind disabled")
+        end
+    end)
+end
+
+---------------------------------------------------------------------
+-- ANTI BACK ATTACH
+--
+-- Bloodlines.lua's Attach to Back and Destroy Player glue the attacker to
+--     yourHRP.CFrame * CFrame.new(side, height, behind)
+-- every frame (behind defaults to 2 / 0 studs), using where you APPEAR on
+-- their screen; the server then checks their hit against where it thinks
+-- you ARE. This makes those disagree: after physics each frame your HRP is
+-- moved to a fresh random spot 18-30 studs under you (up to 14 to the side),
+-- which is the position sent to the server and everyone else, and it's put
+-- back before your next render / physics step, so on your own screen and in
+-- your own physics nothing moves. The attacker keeps teleporting to where
+-- you were a moment ago; by the time their hit reaches the server you're
+-- somewhere else, so it misses. Everyone else sees you jumping around under
+-- the map and can't land hits either.
+--
+-- Your own hits need your real position on the server, so it pauses while
+-- you hold anything other than movement (M1, M2, skill / item keys) and for
+-- 0.4s after, and while you're being carried (the carrier owns your physics).
+--
+-- Timing: the fake spot is set in a task.defer from Heartbeat, so it lands
+-- after every other Heartbeat handler - the game's per-frame floor / lava /
+-- poison / void raycasts read your HRP there and must see the real spot -
+-- and it's undone at the very start of the next frame (BindToRenderStep,
+-- priority First) before the camera or anything else reads it. If something
+-- moved you in between (a teleport), that move is kept instead. The fake spot
+-- stays within ~33 studs because the game closes NPC dialogs past 40.
+---------------------------------------------------------------------
+do
+    local UIS = K.Services.UserInputService
+    local RS_NAME = "KyoAntiAttachRestore"
+    local DEPTH_MIN, DEPTH_MAX, SIDE = 18, 30, 14
+    local MOVEMENT = {
+        W = true, A = true, S = true, D = true, Space = true,
+        LeftShift = true, RightShift = true, LeftControl = true,
+    }
+
+    local D = { conns = {}, bound = false, held = {}, pauseUntil = 0, hrp = nil, real = nil, fake = nil }
+
+    local function inputKey(input)
+        local t = input.UserInputType
+        if t == Enum.UserInputType.Keyboard then
+            local k = input.KeyCode.Name
+            return not MOVEMENT[k] and k or nil
+        end
+        if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.MouseButton2 then
+            return t.Name
+        end
+        return nil
+    end
+
+    local function paused()
+        if next(D.held) ~= nil or os.clock() < D.pauseUntil then return true end
+        -- A scripted cast (Auto Totsuka Blade) holds no key, so it asks for
+        -- the pause directly - its hit needs our real position on the server.
+        if os.clock() < (K.combatPauseUntil or 0) then return true end
+        local s = mySettings()
+        local carried = s and s:FindFirstChild("BeingCarried")
+        return carried ~= nil and carried.Value ~= "None" and carried.Value ~= ""
+    end
+
+    local function restore()
+        local hrp, real, fake = D.hrp, D.real, D.fake
+        D.hrp, D.real, D.fake = nil, nil, nil
+        -- Only undo our own move: if anything else repositioned you since
+        -- (a teleport), keep that.
+        if hrp and hrp.Parent and (hrp.Position - fake.Position).Magnitude < 0.05 then
+            hrp.CFrame = real
+        end
+    end
+
+    local function desync()
+        if not K.flags.antiAttach or D.real or paused() then return end
+        local hrp = root()
+        if not hrp or hrp.Anchored then return end
+        local angle = math.random() * math.pi * 2
+        local side  = math.random() * SIDE
+        local depth = DEPTH_MIN + math.random() * (DEPTH_MAX - DEPTH_MIN)
+        D.hrp, D.real = hrp, hrp.CFrame
+        D.fake = D.real + Vector3.new(math.cos(angle) * side, -depth, math.sin(angle) * side)
+        hrp.CFrame = D.fake
+    end
+
+    local function stop()
+        for k, c in pairs(D.conns) do
+            c:Disconnect()
+            D.conns[k] = nil
+        end
+        if D.bound then
+            pcall(function() RunService:UnbindFromRenderStep(RS_NAME) end)
+            D.bound = false
+        end
+        restore()
+        D.held, D.pauseUntil = {}, 0
+    end
+
+    local function start()
+        stop()
+        -- First thing every frame: back to the real spot before anything reads it.
+        RunService:BindToRenderStep(RS_NAME, Enum.RenderPriority.First.Value, restore)
+        D.bound = true
+        D.conns.hb = RunService.Heartbeat:Connect(function()
+            task.defer(desync) -- after every other Heartbeat handler
+        end)
+        D.conns.began = UIS.InputBegan:Connect(function(input, processed)
+            if processed then return end
+            local k = inputKey(input)
+            if k then D.held[k] = true end
+        end)
+        D.conns.ended = UIS.InputEnded:Connect(function(input)
+            local k = inputKey(input)
+            if k and D.held[k] then
+                D.held[k] = nil
+                D.pauseUntil = os.clock() + 0.4
+            end
+        end)
+        -- Alt-tab can swallow the key-up; don't stay paused forever.
+        D.conns.focus = UIS.WindowFocusReleased:Connect(function() D.held = {} end)
+    end
+
+    UI.combatUtil.element("Toggle", "Anti Back Attach", nil, function(v)
+        K.flags.antiAttach = v.Toggle
+        if v.Toggle then
+            start()
+            notify("Combat", "Anti Back Attach enabled - pauses while you attack", 4)
+        else
+            stop()
+            notify("Combat", "Anti Back Attach disabled")
+        end
+    end)
+end
+
+---------------------------------------------------------------------
+-- AUTO TOTSUKA BLADE
+--
+-- Itachi's Mangekyo / Eternal Mangekyo are M1 = "Amaterasu",
+-- M2 = "Susanoo Strike" (the Totsuka blade). When your Amaterasu CONNECTS
+-- this casts Susanoo Strike at once and holds your body turned at that
+-- victim for the whole swing (it is 5 repeating hits, OccupiedTime 1.5).
+--
+-- Hit detection: the victim is whoever is carrying Amaterasu's own
+-- "BlackFire" ailment (ailments replicate as a child named after the ailment
+-- in char.Ailments / ReplicatedStorage.Ailments[name] - GameManager.hasAilment)
+-- within 1.5s of the server stamping OUR Cooldowns[us].Amaterasu, nearest
+-- first, inside Max Victim Distance.
+--
+-- Stun is deliberately NOT used. It was tried and measured useless: during one
+-- live Amaterasu, 44 candidates yielded FIVE "stunned" players 5188-6363 studs
+-- away (unrelated fights across the map) and one matched BEFORE the real
+-- victim, so the blade swung at nothing. BlackFire was true for exactly one
+-- character - the actual victim at 27 studs.
+--
+-- The distance bound is NOT a reach for Susanoo Strike (the game defines none:
+-- TouchingParts = true, no Range field anywhere). It only bounds how far away
+-- a burning player may be before we believe they are OUR victim, since other
+-- people's Amaterasu lights players up anywhere on the map.
+--
+-- Facing: the HumanoidRootPart CFrame is rewritten each frame, yaw only
+-- (position untouched, no tilt). Deliberately NOT a BodyGyro - the game's
+-- own anti-cheat self-reports ANY BodyGyro added to your HRP (the name
+-- allowlist only covers BodyVelocity / BodyPosition / LinearVelocity), so a
+-- gyro here would trip Offense 1E.
+--
+-- While striking it raises K.combatPauseUntil, which Anti Back Attach honours
+-- - a scripted cast holds no key, so without it the desync would be active
+-- and the strike would land where the server thinks you are, not on them.
+---------------------------------------------------------------------
+do
+    local AMA, TOTSUKA = "Amaterasu", "Susanoo Strike"
+    local WINDOW, HOLD, STEP = 1.5, 2.6, 0.05
+
+    local T = { conns = {}, armedUntil = 0, busy = false, faceConn = nil, hunting = false, maxDist = 60 }
+
+    -- The ONLY signal used is the BlackFire ailment - Amaterasu's own Ailment,
+    -- replicated as a child named after the ailment in char.Ailments /
+    -- ReplicatedStorage.Ailments[name]. Stun was tried and measured to be
+    -- useless noise: during a live Amaterasu, 44 candidates produced FIVE
+    -- "stunned" players at 5188-6363 studs (random people fighting across the
+    -- map) and one of them was matched BEFORE the real victim. BlackFire was
+    -- true for exactly one character: the actual victim, 27 studs away.
+    local function ailmentsOf(char)
+        local own = char:FindFirstChild("Ailments")
+        if own then return own end
+        local shared = RepStorage:FindFirstChild("Ailments")
+        return shared and shared:FindFirstChild(char.Name)
+    end
+
+    -- Absolute state, not a before/after diff: the server applies the burn in
+    -- the SAME tick it stamps our cooldown, so by the time our client is told
+    -- the cast happened the victim is often already lit, and a diff would see
+    -- "no change" and never fire.
+    local function burning(char)
+        local ail = ailmentsOf(char)
+        return ail ~= nil and ail:FindFirstChild("BlackFire") ~= nil
+    end
+
+    -- Everyone Amaterasu could have burned: other players and NPC/mob rigs.
+    local function candidates()
+        local out, seen = {}, {}
+        for _, plr in ipairs(Players:GetPlayers()) do
+            local char = plr ~= LP and plr.Character
+            if char and char:FindFirstChild("HumanoidRootPart") then
+                out[#out + 1] = char
+                seen[char] = true
+            end
+        end
+        for _, m in ipairs(workspace:GetChildren()) do
+            if m:IsA("Model") and not seen[m] and m ~= LP.Character
+               and m:FindFirstChildOfClass("Humanoid") and m:FindFirstChild("HumanoidRootPart") then
+                out[#out + 1] = m
+            end
+        end
+        return out
+    end
+
+    local function faceStop()
+        if T.faceConn then T.faceConn:Disconnect() T.faceConn = nil end
+    end
+
+    -- Yaw-only turn toward the victim, every frame, until the swing ends.
+    local function faceFor(char)
+        faceStop()
+        local deadline = os.clock() + HOLD
+        T.faceConn = RunService.RenderStepped:Connect(function()
+            local myHrp = root()
+            local tHrp  = char and char:FindFirstChild("HumanoidRootPart")
+            if not myHrp or not tHrp or not K.flags.autoTotsuka or os.clock() > deadline then
+                faceStop()
+                return
+            end
+            K.combatPauseUntil = os.clock() + 0.3
+            local from, to = myHrp.Position, tHrp.Position
+            local flat = Vector3.new(to.X - from.X, 0, to.Z - from.Z)
+            if flat.Magnitude < 0.01 then return end
+            myHrp.CFrame = CFrame.lookAt(from, from + flat.Unit)
+        end)
+    end
+
+    local function strike(char)
+        if T.busy then return end
+        T.busy = true
+        -- Face first so the swing starts already pointed at them.
+        faceFor(char)
+        K.combatPauseUntil = os.clock() + HOLD
+        if not K.castSkill or not K.castSkill(TOTSUKA, 18) then
+            -- cooldown / not owned / no resolve: drop the facing too
+            faceStop()
+        end
+        task.delay(HOLD, function() T.busy = false end)
+    end
+
+    -- Armed by our own Amaterasu: poll for someone newly burning, nearest
+    -- first, inside the Max Victim Distance bound. The bound matters - other
+    -- people's Amaterasu burns players anywhere on the map, and without it a
+    -- victim thousands of studs away gets picked (measured: real victim 27
+    -- studs, unrelated players 5188-6363).
+    local function hunt()
+        if T.hunting then return end
+        T.hunting = true
+        task.spawn(function()
+            local pool = candidates()
+            local deadline = os.clock() + WINDOW
+            while K.flags.autoTotsuka and os.clock() < deadline do
+                local best, bestDist = nil, math.huge
+                local myHrp = root()
+                if myHrp then
+                    for _, char in ipairs(pool) do
+                        local tHrp = char.Parent and char:FindFirstChild("HumanoidRootPart")
+                        if tHrp and burning(char) then
+                            local d = (tHrp.Position - myHrp.Position).Magnitude
+                            if d <= T.maxDist and d < bestDist then bestDist, best = d, char end
+                        end
+                    end
+                end
+                if best then
+                    T.hunting = false
+                    strike(best)
+                    return
+                end
+                task.wait(STEP)
+            end
+            T.hunting = false
+        end)
+    end
+
+    local function stop()
+        for k, c in pairs(T.conns) do
+            c:Disconnect()
+            T.conns[k] = nil
+        end
+        faceStop()
+        T.armedUntil, T.busy, T.hunting = 0, false, false
+    end
+
+    local function start()
+        stop()
+        -- Our own Amaterasu: the server stamps the cooldown entry on use.
+        local function armFrom(entry)
+            T.conns[entry] = entry.Changed:Connect(function()
+                if K.flags.autoTotsuka then hunt() end
+            end)
+        end
+        local all  = RepStorage:FindFirstChild("Cooldowns")
+        local mine = all and all:FindFirstChild(LP.Name)
+        if mine then
+            local entry = mine:FindFirstChild(AMA)
+            if entry then armFrom(entry) end
+            T.conns.cdAdded = mine.ChildAdded:Connect(function(ch)
+                if ch.Name == AMA and K.flags.autoTotsuka then
+                    armFrom(ch)
+                    hunt() -- first-ever use this life
+                end
+            end)
+        end
+    end
+
+    UI.combatUtil.element("Toggle", "Auto Totsuka Blade", nil, function(v)
+        K.flags.autoTotsuka = v.Toggle
+        if not v.Toggle then
+            stop()
+            notify("Combat", "Auto Totsuka Blade disabled")
+            return
+        end
+        start()
+        -- Susanoo Strike is the awakening's M2, so it only exists while that
+        -- awakening is up. Say so rather than silently doing nothing.
+        if K.skillFromAwakening and K.skillFromAwakening(TOTSUKA) then
+            notify("Combat", "Auto Totsuka Blade enabled - Amaterasu hit casts Susanoo Strike", 4)
+        else
+            notify("Combat", "Auto Totsuka Blade on - awaken Itachi's Mangekyo / EMS to use it", 5)
+        end
+    end)
+
+    -- Not a tuned reach (the game defines none for Susanoo Strike) - it is the
+    -- bound on how far away a burning player may be before we accept them as
+    -- OUR Amaterasu victim. A real hit measured 27 studs out.
+    UI.combatUtil.element("Slider", "Max Victim Distance", {
+        default = { min = 10, max = 300, default = 60 },
+        suffix  = " studs",
+    }, function(v)
+        T.maxDist = v.Slider
     end)
 end
 
