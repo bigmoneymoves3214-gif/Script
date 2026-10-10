@@ -1,5 +1,5 @@
 --[[
-    Kyo - Private
+    Sys - Private
     Bloodlines (PlaceId 10266164381)
 
     Private build. Not the public Bloodlines script:
@@ -67,10 +67,10 @@ end
 ---------------------------------------------------------------------
 local _genvKey = "_" .. tostring(math.random(0x100000, 0xFFFFFF))
 do
-    local ok, existing = pcall(function() return getgenv().__kyo_priv end)
+    local ok, existing = pcall(function() return getgenv().__sys_priv end)
     if ok and existing then
         -- Already running: ask the live instance to unload, then bail.
-        pcall(function() getgenv().__kyo_priv() end)
+        pcall(function() getgenv().__sys_priv() end)
         task.wait(0.35)
     end
 end
@@ -214,14 +214,13 @@ local Atlas = (function()
     local TextService      = K.Services.TextService
     local RunService       = K.Services.RunService
     local HttpService      = K.Services.HttpService
-    local GuiService       = game:GetService("GuiService")
     local LocalPlayer      = K.LocalPlayer
     local Mouse            = LocalPlayer:GetMouse()
 
-    local ACCENT     = Color3.fromRGB(152, 84, 255)
-    local ACCENT_DIM = Color3.fromRGB(92, 46, 168)
+    local ACCENT     = Color3.fromRGB(255, 255, 255)
+    local ACCENT_DIM = Color3.fromRGB(140, 140, 140)
     local IDLE       = Color3.fromRGB(150, 150, 150)
-    local HOVER      = Color3.fromRGB(255, 255, 255)
+    local HOVER      = Color3.fromRGB(205, 205, 205)
     local DIM        = Color3.fromRGB(100, 100, 100)
     local BLACK      = Color3.fromRGB(0, 0, 0)
     local FONT       = Enum.Font.Ubuntu
@@ -552,7 +551,7 @@ local Atlas = (function()
         menu.toggle_key  = Enum.KeyCode.Insert
         menu.loading_cfg = false
 
-        cfg_folder = cfg_folder or "KyoPrivate"
+        cfg_folder = cfg_folder or "SysPrivate"
 
         -- makefolder does not create intermediate directories, so walk the
         -- path and create each level that is missing.
@@ -696,19 +695,23 @@ local Atlas = (function()
             Size                   = UDim2.new(0, 17, 0, 17),
             Image                  = "rbxassetid://7205257578",
             ZIndex                 = 6969,
-            Visible                = true,
+            Visible                = false,
         }, ScreenGui)
 
-        -- The GUI ignores the topbar inset, so the cursor has to add it back.
-        -- The public source hardcoded +36, which is only correct on one screen
-        -- configuration - GetGuiInset() is the real offset.
+        -- GetMouseLocation() is already measured from the real top-left of the
+        -- screen - it is Mouse.X/Y with the topbar inset included - and this
+        -- ScreenGui has IgnoreGuiInset = true, so its origin is the same point.
+        -- The two already agree and the position is used raw. The public source
+        -- added a hardcoded +36 here, and an earlier pass of this rewrite added
+        -- GetGuiInset() instead; both double-count the inset and leave the drawn
+        -- cursor sitting a topbar's height below the pointer the game is
+        -- actually clicking with.
         local cursor_conn
         local function start_cursor()
             if cursor_conn then return end
             cursor_conn = track(RunService.RenderStepped:Connect(function()
-                local pos    = UserInputService:GetMouseLocation()
-                local inset  = GuiService:GetGuiInset()
-                Cursor.Position = UDim2.fromOffset(pos.X + inset.X, pos.Y + inset.Y)
+                local pos = UserInputService:GetMouseLocation()
+                Cursor.Position = UDim2.fromOffset(pos.X, pos.Y)
             end))
         end
         local function stop_cursor()
@@ -716,7 +719,6 @@ local Atlas = (function()
             pcall(function() cursor_conn:Disconnect() end)
             cursor_conn = nil
         end
-        start_cursor()
 
         lib:create("TextLabel", {
             Name                   = "Title",
@@ -1103,7 +1105,7 @@ local Atlas = (function()
                             store[flag] = value
                             local ok, err = pcall(callback, value)
                             if not ok then
-                                warn("[Kyo] element callback error (" .. tostring(flag) .. "): " .. tostring(err))
+                                warn("[Sys] element callback error (" .. tostring(flag) .. "): " .. tostring(err))
                             end
                         end
 
@@ -2186,6 +2188,307 @@ end)()
 yield(true)
 
 ---------------------------------------------------------------------
+-- LOAD SPLASH
+--
+-- A ViewportFrame renders real 3D inside a GUI, so the logo is an actual
+-- spinning mesh rather than a flipbook of images.
+--
+-- The mesh is a Part + SpecialMesh rather than a MeshPart: MeshPart.MeshId is
+-- read-only at runtime, so a MeshPart built from a script arrives empty.
+-- SpecialMesh with MeshType = FileMesh takes its MeshId at runtime and is the
+-- only way to do this from an executor.
+--
+-- Sequence:
+--   0.0s  logo fades in dead centre and starts turning
+--   3.0s  the word takes the centre of the screen and pushes the logo left,
+--         its letters rising in one after another
+--   ~4.0s once the word has settled the logo eases to a stop facing forward
+--   ~5.6s everything fades out and the menu is revealed
+--
+-- Centring: the WORD owns the centre of the screen. Everything is positioned
+-- from the measured width of the word, so the lockup stays correct whatever
+-- the word or the font size becomes - a hardcoded offset only looks right at
+-- one size.
+--
+-- NOTE: this block runs before the shared-state locals exist, so it reaches
+-- through K rather than using RunService / LP directly.
+---------------------------------------------------------------------
+local Splash = {}
+
+do
+    local MESH_ID    = "rbxassetid://129400024703571"
+    local TEXTURE_ID = "rbxassetid://118736866214609"
+    local IMAGE_ID   = ""      -- 2D logo decal, used if the mesh cannot load
+
+    local WORD       = "Sys"
+    local WORD_FONT  = Enum.Font.Ubuntu
+    local WORD_SIZE  = 58
+    local TRACKING   = 3       -- px between letters; a wordmark needs air
+    local GAP        = 30      -- px between logo and word
+
+    local VP_SIZE    = 260
+    local SPIN_SPEED = 0.9
+    local TILT       = math.rad(12)
+
+    local FADE_IN     = 0.5
+    local HOLD_CENTRE = 3.0
+    local SHIFT       = 0.7
+    local LETTER_STEP = 0.07
+    local LETTER_RISE = 0.45
+    local SETTLE      = 0.75   -- spin easing to a forward-facing stop
+    local HOLD_TEXT   = 1.5
+    local FADE_OUT    = 0.5
+
+    Splash.finished = false
+
+    local function splashParent()
+        if gethui then
+            local ok, hui = pcall(gethui)
+            if ok and hui then return hui end
+        end
+        local ok, core = pcall(function() return game:GetService("CoreGui") end)
+        if ok and core then return core end
+        return K.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    end
+
+    function Splash.show()
+        if Splash.gui then return end
+
+        local TS  = K.Services.TweenService
+        local TXS = K.Services.TextService
+
+        local gui = Instance.new("ScreenGui")
+        gui.Name           = K.Services.HttpService:GenerateGUID(false)
+        gui.IgnoreGuiInset = true
+        gui.ResetOnSpawn   = false
+        gui.DisplayOrder   = 10000
+        gui.Parent         = splashParent()
+        Splash.gui = gui
+
+        local back = Instance.new("Frame")
+        back.Size                   = UDim2.new(1, 0, 1, 0)
+        back.BackgroundColor3       = Color3.fromRGB(0, 0, 0)
+        back.BackgroundTransparency = 1
+        back.BorderSizePixel        = 0
+        back.Parent                 = gui
+
+        -- Measure each letter so the word can be centred exactly.
+        local letters, wordWidth = {}, 0
+        for i = 1, #WORD do
+            local ch = WORD:sub(i, i)
+            local ok, sz = pcall(function()
+                return TXS:GetTextSize(ch, WORD_SIZE, WORD_FONT, Vector2.new(1000, 200))
+            end)
+            local w = (ok and sz) and sz.X or WORD_SIZE * 0.6
+            letters[i] = { ch = ch, w = w }
+            wordWidth = wordWidth + w + (i < #WORD and TRACKING or 0)
+        end
+
+        -- The word is centred on screen; the logo is pushed out to its left.
+        local wordLeft = -wordWidth / 2
+        local logoX    = wordLeft - GAP - VP_SIZE / 2
+
+        local vp = Instance.new("ViewportFrame")
+        vp.AnchorPoint            = Vector2.new(0.5, 0.5)
+        vp.Position               = UDim2.new(0.5, 0, 0.5, 0)   -- dead centre to start
+        vp.Size                   = UDim2.new(0, VP_SIZE, 0, VP_SIZE)
+        vp.BackgroundTransparency = 1
+        vp.ImageTransparency      = 1
+        -- Flat white ambient: the texture carries the shading, so lighting
+        -- that falls off would just darken the artwork's own gradient.
+        vp.Ambient                = Color3.fromRGB(255, 255, 255)
+        vp.LightColor             = Color3.fromRGB(255, 255, 255)
+        vp.LightDirection         = Vector3.new(-0.3, -0.5, -1)
+        vp.Parent                 = gui
+
+        local part = Instance.new("Part")
+        part.Anchored   = true
+        part.CanCollide = false
+        part.Size       = Vector3.new(1, 1, 1)
+        part.CFrame     = CFrame.new()
+        part.Color      = Color3.fromRGB(255, 255, 255)
+        part.Material   = Enum.Material.SmoothPlastic
+
+        local mesh = Instance.new("SpecialMesh")
+        mesh.MeshType = Enum.MeshType.FileMesh
+        mesh.MeshId   = MESH_ID
+        mesh.Scale    = Vector3.new(2.2, 2.2, 2.2)
+        if TEXTURE_ID ~= "" then mesh.TextureId = TEXTURE_ID end
+        mesh.Parent   = part
+        part.Parent   = vp
+
+        local cam = Instance.new("Camera")
+        cam.FieldOfView  = 40
+        cam.CFrame       = CFrame.new(Vector3.new(0, 0.6, 7), Vector3.new(0, 0, 0))
+        cam.Parent       = vp
+        vp.CurrentCamera = cam
+
+        local flat = Instance.new("ImageLabel")
+        flat.AnchorPoint            = Vector2.new(0.5, 0.5)
+        flat.Position               = UDim2.new(0.5, 0, 0.5, 0)
+        flat.Size                   = UDim2.new(0, VP_SIZE * 0.8, 0, VP_SIZE * 0.8)
+        flat.BackgroundTransparency = 1
+        flat.ImageTransparency      = 1
+        flat.Visible                = false
+        flat.Image                  = IMAGE_ID
+        flat.Parent                 = gui
+
+        -- One label per letter: TextLabel has no tracking property, and this
+        -- also lets them arrive one at a time instead of all at once.
+        local labels, x = {}, wordLeft
+        for i, L in ipairs(letters) do
+            local holder = Instance.new("Frame")
+            holder.AnchorPoint            = Vector2.new(0, 0.5)
+            holder.Position               = UDim2.new(0.5, x, 0.5, 16)   -- starts low
+            holder.Size                   = UDim2.new(0, L.w, 0, WORD_SIZE + 10)
+            holder.BackgroundTransparency = 1
+            holder.Parent                 = gui
+
+            local lb = Instance.new("TextLabel")
+            lb.BackgroundTransparency = 1
+            lb.Size                   = UDim2.new(1, 0, 1, 0)
+            lb.Font                   = WORD_FONT
+            lb.Text                   = L.ch
+            lb.TextSize               = WORD_SIZE
+            lb.TextColor3             = Color3.fromRGB(255, 255, 255)
+            lb.TextTransparency       = 1
+            lb.TextXAlignment         = Enum.TextXAlignment.Center
+            lb.Parent                 = holder
+
+            labels[i] = { holder = holder, label = lb, x = x }
+            x = x + L.w + TRACKING
+        end
+
+        Splash.parts = { back = back, vp = vp, flat = flat, labels = labels }
+
+        ---------------------------------------------------------------
+        -- Spin, then ease to a forward-facing stop.
+        --
+        -- Settling tweens to the NEXT whole turn rather than back to the
+        -- nearest angle, so it always finishes winding forwards instead of
+        -- stuttering backwards into place. The tilt unwinds over the same
+        -- ramp, so it ends square to the camera.
+        ---------------------------------------------------------------
+        local angle, settling, tStart, from, target = 0, false, 0, 0, 0
+
+        local function beginSettle()
+            if settling then return end
+            settling = true
+            tStart   = os.clock()
+            from     = angle
+            target   = math.ceil(angle / (math.pi * 2)) * (math.pi * 2)
+            if target - from < 0.35 then target = target + math.pi * 2 end
+        end
+        Splash.settle = beginSettle
+
+        Splash.conn = bind(K.Services.RunService.RenderStepped:Connect(function(dt)
+            if not part.Parent then return end
+
+            local tilt = TILT
+            if settling then
+                local t = math.clamp((os.clock() - tStart) / SETTLE, 0, 1)
+                local e = 1 - (1 - t) ^ 4            -- quart out
+                angle = from + (target - from) * e
+                tilt  = TILT * (1 - e)
+            else
+                angle = angle + dt * SPIN_SPEED
+            end
+
+            part.CFrame = CFrame.Angles(tilt, angle, 0)
+            if flat.Visible then
+                flat.Rotation = settling and 0 or math.deg(angle) * 0.5
+            end
+        end))
+
+        task.spawn(function()
+            local ok = pcall(function()
+                game:GetService("ContentProvider"):PreloadAsync({ part }, function(_, status)
+                    if status ~= Enum.AssetFetchStatus.Success then
+                        Splash.meshFailed = true
+                    end
+                end)
+            end)
+            if (not ok or Splash.meshFailed) and Splash.gui then
+                warn("[Sys] logo mesh could not be fetched - check MESH_ID is a mesh "
+                     .. "asset (MeshPart.MeshId in Studio), not a model id")
+                vp.Visible = false
+                if IMAGE_ID ~= "" then
+                    flat.Visible = true
+                    TS:Create(flat, TweenInfo.new(0.4), { ImageTransparency = 0 }):Play()
+                end
+            end
+        end)
+
+        Splash.thread = task.spawn(function()
+            local easeOut = TweenInfo.new(FADE_IN, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+            TS:Create(back, easeOut, { BackgroundTransparency = 0.4 }):Play()
+            TS:Create(vp,   easeOut, { ImageTransparency = 0 }):Play()
+
+            task.wait(HOLD_CENTRE)
+
+            -- The word pushes the logo aside. Quint on the logo, not Back: a
+            -- spring on a spinning object reads as a glitch.
+            local slide = TweenInfo.new(SHIFT, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+            TS:Create(vp,   slide, { Position = UDim2.new(0.5, logoX, 0.5, 0) }):Play()
+            TS:Create(flat, slide, { Position = UDim2.new(0.5, logoX, 0.5, 0) }):Play()
+
+            for i, L in ipairs(labels) do
+                task.delay(SHIFT * 0.35 + (i - 1) * LETTER_STEP, function()
+                    local rise = TweenInfo.new(LETTER_RISE, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+                    TS:Create(L.holder, rise, { Position = UDim2.new(0.5, L.x, 0.5, 0) }):Play()
+                    TS:Create(L.label,  rise, { TextTransparency = 0 }):Play()
+                end)
+            end
+
+            -- When the last letter lands, stop the spin.
+            local wordDone = SHIFT * 0.35 + (#labels - 1) * LETTER_STEP + LETTER_RISE
+            task.delay(wordDone, beginSettle)
+
+            task.wait(wordDone + SETTLE + HOLD_TEXT)
+
+            local easeIn = TweenInfo.new(FADE_OUT, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+            TS:Create(back, easeIn, { BackgroundTransparency = 1 }):Play()
+            TS:Create(vp,   easeIn, { ImageTransparency = 1 }):Play()
+            TS:Create(flat, easeIn, { ImageTransparency = 1 }):Play()
+            for _, L in ipairs(labels) do
+                TS:Create(L.label, easeIn, { TextTransparency = 1 }):Play()
+            end
+
+            task.wait(FADE_OUT + 0.05)
+            Splash.finished = true
+        end)
+    end
+
+    function Splash.await(timeout)
+        local deadline = os.clock() + (timeout or 15)
+        while not Splash.finished and os.clock() < deadline do
+            task.wait(0.05)
+        end
+    end
+
+    function Splash.hide()
+        local gui = Splash.gui
+        Splash.gui = nil
+        if Splash.conn then
+            unbind(Splash.conn)
+            Splash.conn = nil
+        end
+        if gui then pcall(function() gui:Destroy() end) end
+        Splash.parts = nil
+    end
+end
+
+do
+    local ok, err = pcall(Splash.show)
+    if not ok then
+        warn("[Sys] splash failed: " .. tostring(err))
+        Splash.finished = true   -- never let a broken splash hold the menu
+    end
+end
+
+yield(true)
+
+---------------------------------------------------------------------
 -- WINDOW
 ---------------------------------------------------------------------
 local ICONS = {
@@ -2197,7 +2500,10 @@ local ICONS = {
     settings  = "rbxassetid://10734950309",  -- gear
 }
 
-local Window = Atlas.new("Kyo - Private", "KyoPrivate/Bloodlines")
+local Window = Atlas.new("Sys - Private", "SysPrivate/Bloodlines")
+
+-- Built behind the splash; revealed once the sequence has played out.
+Window.SetOpen(false)
 
 local function notify(title, text, duration)
     Atlas:notify(title, text, duration or 3)
@@ -2222,6 +2528,7 @@ UI.secPlayer         = TabPlayer.new_section("General")
 UI.boxMovement       = UI.secPlayer.new_sector("Movement", "Left")
 UI.boxProtection     = UI.secPlayer.new_sector("Protection", "Right")
 UI.playerUtil        = UI.secPlayer.new_sector("Utility", "Right")
+UI.playerClothing    = UI.secPlayer.new_sector("Clothing", "Left")
 
 UI.secCombat         = TabPlayer.new_section("Combat")
 -- UI.parry             = UI.secCombat.new_sector("Auto Parry", "Left")
@@ -2246,7 +2553,6 @@ UI.boxMobESP         = UI.secVisMobs.new_sector("Mob ESP", "Left")
 UI.boxMobESPOpt      = UI.secVisMobs.new_sector("Options", "Right")
 
 UI.secWorld          = TabVisuals.new_section("World")
-UI.itemESP           = UI.secWorld.new_sector("Item ESP", "Left")
 UI.camera            = UI.secWorld.new_sector("Camera", "Right")
 UI.worldVisuals      = UI.secWorld.new_sector("World Visuals", "Left")
 UI.performance       = UI.secWorld.new_sector("Performance", "Right")
@@ -2266,7 +2572,7 @@ UI.boxViewData       = UI.secMiscData.new_sector("View Data", "Left")
 UI.boxPurchase       = UI.secMiscData.new_sector("Purchase", "Right")
 
 UI.secFarm           = TabMisc.new_section("Farm")
-UI.mastery           = UI.secFarm.new_sector("Auto Farm Mastery", "Left")
+UI.mastery           = UI.secFarm.new_sector("Auto Farm Activations", "Left")
 UI.masteryOpt        = UI.secFarm.new_sector("Options", "Right")
 UI.ramen             = UI.secFarm.new_sector("Ramen Contest", "Left")
 
@@ -2337,6 +2643,44 @@ end
 -- sense watcher. Cache it for a couple of seconds rather than walking the
 -- service every frame from three different systems.
 local _settingsCache, _settingsCacheTime = nil, 0
+
+-- Players:GetPlayers() builds a fresh table on every call, and three hot
+-- paths call it: the ESP render loop every frame, silent aim's refresh every
+-- frame while the aim key is down, and the hitbox sweep on every Heartbeat.
+-- The roster only changes when somebody joins or leaves, so it is kept.
+--
+-- PlayerRemoving fires BEFORE the player leaves the service, so the rebuild is
+-- deferred or the one who just left would still be in the list.
+--
+-- Callers get the real table, not a copy: read it, never hold or mutate it.
+local _roster = Players:GetPlayers()
+
+local function playerList()
+    return _roster
+end
+
+bind(Players.PlayerAdded:Connect(function()
+    _roster = Players:GetPlayers()
+end))
+
+bind(Players.PlayerRemoving:Connect(function()
+    task.defer(function() _roster = Players:GetPlayers() end)
+end))
+
+-- Same shape as gameSettings below: the Cooldowns folder is walked to from
+-- five places, two of them on a timer per player, and the service lookup is
+-- not free.
+local _cooldownsCache, _cooldownsCacheTime = nil, 0
+
+local function cooldownsFolder()
+    local now = os.clock()
+    if _cooldownsCache and _cooldownsCache.Parent and (now - _cooldownsCacheTime) < 2 then
+        return _cooldownsCache
+    end
+    _cooldownsCache     = RepStorage:FindFirstChild("Cooldowns")
+    _cooldownsCacheTime = now
+    return _cooldownsCache
+end
 
 local function gameSettings()
     local now = os.clock()
@@ -3263,7 +3607,7 @@ local function hitboxTargets(myPos)
     local out = {}
     local settings = gameSettings()
 
-    for _, target in ipairs(Players:GetPlayers()) do
+    for _, target in ipairs(playerList()) do
         if target ~= LP and not table.find(Hitbox.whitelist, target.Name) then
             local char = target.Character
             local hrp  = char and char:FindFirstChild("HumanoidRootPart")
@@ -3370,6 +3714,896 @@ end)
 
 yield(true)
 
+-- Scoped: this block needs fifteen locals and the main chunk is already
+-- close to Lua's 200-local ceiling, so they live in a block of their own.
+do
+---------------------------------------------------------------------
+-- CLOTHING CHANGER
+--
+-- Two halves, because the game keeps the two kinds of outfit in two very
+-- different places.
+--
+-- A plain outfit is nothing but a Shirt and a Pants texture, and both sit in
+-- ReplicatedStorage.Clothing.<name>, which the client can read. Wearing one
+-- is two property writes.
+--
+-- An ascended outfit is real geometry, and needs a model plus a rigging.
+--
+-- The model is looked for in ReplicatedStorage.Clothing.<name> first, under
+-- Normal or Broken, mirroring where the server takes it from. The server's own
+-- copy is ServerStorage.App.Clothing, which the client cannot see, so if the
+-- replicated folder does not mirror it the model is taken off somebody who is
+-- already wearing it instead - the server welds it into their character, where
+-- it replicates like any other instance.
+--
+-- The rigging comes from one of three places, in this order:
+--
+--   1. The model's own Motor6Ds, when they carry a Part0 attribute naming the
+--      limb. The offsets are already baked in and the server does nothing but
+--      resolve the name (gamescript2.txt:5127). Twelve outfits work this way
+--      and need no data from us at all.
+--   2. CLOTH_WELDS below, lifted out of GameManager:weld, for the eleven older
+--      outfits whose offsets are hardcoded one branch at a time.
+--   3. A wearer's live joints. weldParts parents each Weld to the clothing
+--      piece with Part0 on the limb, so a wearer carries its own placement.
+--
+-- Between them that covers 24 of the 27 ascended outfits with nobody else in
+-- the server. The remaining three - Akatsuki Cloak, Avenger's Outfit and
+-- Martial Artist - build their pieces in a way the dump does not express
+-- cleanly, so they still want a wearer to copy from, and say so when picked.
+--
+-- All of it is local. Texture writes and client-made welds do not replicate,
+-- so the outfit is visible to us and to nobody else.
+---------------------------------------------------------------------
+-- Every ascended outfit the game defines (u20.Clothing, gamescript2.txt).
+-- Listed unconditionally so the pick always exists; whether its geometry can
+-- be reached is decided at apply time, and said plainly if it cannot.
+local ASCENDED_NAMES = {
+    "Ascended Akatsuki Cloak",
+    "Ascended Akatsuki Leader",
+    "Ascended Anbu",
+    "Ascended Assassin's Garments",
+    "Ascended Avenger's Outfit",
+    "Ascended Biyo Armor",
+    "Ascended Brawler's Outfit",
+    "Ascended Durana Kage",
+    "Ascended Durana Outfit",
+    "Ascended Fighter's Outfit",
+    "Ascended Haku Outfit",
+    "Ascended Martial Artist",
+    "Ascended Moon Rags",
+    "Ascended Orange Jumpsuit",
+    "Ascended Peacemaker",
+    "Ascended Rain Kage",
+    "Ascended Rain Outfit",
+    "Ascended Reanimated Cloak",
+    "Ascended Senju Armor",
+    "Ascended Shisui Outfit",
+    "Ascended Slithering Outfit",
+    "Ascended Snow Kage",
+    "Ascended Snow Outfit",
+    "Ascended Sorythia Kage",
+    "Ascended Sorythia Outfit",
+    "Ascended Thunder Cloak",
+    "Ascended Wanderer's Outfit",
+}
+
+-- Outfits whose stored model describes its own rigging: each Motor6D carries
+-- a Part0 attribute naming the limb and the offsets are already baked in, so
+-- the server only resolves the name (gamescript2.txt:5127). Substring matches,
+-- exactly as the game matches them - note "Akatsuki Leader" also catches the
+-- ascended one.
+local SELF_RIGGED = {
+    "Ascended Sorythia Kage",
+    "Ascended Durana Kage",
+    "Ascended Rain Kage",
+    "Ascended Snow Kage",
+    "Akatsuki Leader",
+    "Ascended Snow Outfit",
+    "Ascended Sorythia Outfit",
+    "Ascended Rain Outfit",
+    "Ascended Durana Outfit",
+    "Ascended Anbu",
+    "Ascended Orange Jumpsuit",
+    "Ascended Haku Outfit",
+    "Ascended Shisui Outfit",
+}
+
+-- The older outfits have their offsets written out longhand instead, one
+-- branch per outfit in GameManager:weld. Lifted from the dump rather than
+-- eyeballed. `clone` marks a mirrored piece that ships once and is copied
+-- for the other side, which is what the server does.
+local CLOTH_WELDS = {
+    -- gamescript2.txt:4779. The Cloak piece is deliberately absent: the server
+    -- never welds it, it hangs off an AnimationController playing
+    -- AkatsukiCloakIdle, so the leftover pass pins it by authored offset and it
+    -- renders in place without the sway.
+    ["Ascended Akatsuki Cloak"] = {
+        { limb = "Torso",     piece = "RootPart", c0 = CFrame.new(0, -1.75, 0) },
+        { limb = "Right Arm", piece = "RightArm", c0 = CFrame.new(0, -0.05, 0.1) },
+        { limb = "Left Arm",  piece = "LeftArm",  c0 = CFrame.new(0, -0.05, 0.1) },
+    },
+    -- Same model and the same branch, under the other name.
+    ["Ascended Akatsuki Leader"] = {
+        { limb = "Torso",     piece = "RootPart", c0 = CFrame.new(0, -1.75, 0) },
+        { limb = "Right Arm", piece = "RightArm", c0 = CFrame.new(0, -0.05, 0.1) },
+        { limb = "Left Arm",  piece = "LeftArm",  c0 = CFrame.new(0, -0.05, 0.1) },
+    },
+    -- gamescript2.txt:4529
+    ["Ascended Avenger's Outfit"] = {
+        { limb = "Right Arm", piece = "RightArm",    c0 = CFrame.new(0.002, 0.094, 0) },
+        { limb = "Left Arm",  piece = "LeftArm",     c0 = CFrame.new(-0.002, 0.094, 0) },
+        { limb = "Torso",     piece = "TorsoMain",   c0 = CFrame.new(0, 0.216, 0.139) },
+        { limb = "Torso",     piece = "Zipper",      c0 = CFrame.new(0, -0.186, -0.533) },
+        { limb = "Torso",     piece = "RobeMain",    c0 = CFrame.new(0, -0.748, -0.01) },
+        { limb = "Right Leg", piece = "RightLeg",    c0 = CFrame.new(0.016, 0.12, -0.01) },
+        { limb = "Left Leg",  piece = "LeftLeg",     c0 = CFrame.new(-0.016, 0.12, -0.01) },
+        { limb = "Right Leg", piece = "RightRobe",   c0 = CFrame.new(0.141, 0.402, -0.01) },
+        { limb = "Left Leg",  piece = "LeftRobe",    c0 = CFrame.new(-0.141, 0.402, -0.01) },
+        { limb = "Right Leg", piece = "RightSandal", c0 = CFrame.new(-0.002, -0.911, 0.005) },
+        { limb = "Left Leg",  piece = "LeftSandal",  c0 = CFrame.new(0.002, -0.911, 0.005) },
+    },
+    -- gamescript2.txt:4494
+    ["Ascended Martial Artist"] = {
+        { limb = "Right Arm", piece = "RightArm",    c0 = CFrame.new(0.026, 0.102, -0.007) },
+        { limb = "Left Arm",  piece = "LeftArm",     c0 = CFrame.new(-0.026, 0.102, -0.007) },
+        { limb = "Torso",     piece = "TorsoMain",   c0 = CFrame.new(0.025, 0.12, -0.021) },
+        { limb = "Torso",     piece = "RobeMain",    c0 = CFrame.new(0.018, -0.893, -0.007) },
+        { limb = "Right Leg", piece = "RightLeg",    c0 = CFrame.new(0.036, 0.153, -0.007) },
+        { limb = "Left Leg",  piece = "LeftLeg",     c0 = CFrame.new(-0.036, 0.153, -0.007) },
+        { limb = "Right Leg", piece = "RightRobe",   c0 = CFrame.new(0.076, 0.485, -0.007) },
+        { limb = "Left Leg",  piece = "LeftRobe",    c0 = CFrame.new(-0.076, 0.485, -0.007) },
+        { limb = "Right Leg", piece = "RightSandal", c0 = CFrame.new(0.034, -0.849, 0.002) },
+        { limb = "Left Leg",  piece = "LeftSandal",  c0 = CFrame.new(-0.034, -0.849, 0.002) },
+    },
+    ["Ascended Assassin's Garments"] = {
+        { limb = "Left Arm", piece = "ArmBrace", c0 = CFrame.new(0, -0.53, 0) * CFrame.Angles(0, 3.141592653589793, 0) },
+        { limb = "Right Arm", piece = "ArmBrace", clone = true, c0 = CFrame.new(0, -0.53, 0) * CFrame.Angles(0, 3.141592653589793, 0) },
+        { limb = "Left Leg", piece = "LegBrace", c0 = CFrame.new(0, -0.6, 0) * CFrame.Angles(0, -1.5707963267948966, 0) },
+        { limb = "Right Leg", piece = "LegBrace", clone = true, c0 = CFrame.new(0, -0.6, 0) * CFrame.Angles(0, -1.5707963267948966, 0) },
+    },
+    ["Ascended Biyo Armor"] = {
+        { limb = "Torso", piece = "SenjuTorso", c0 = CFrame.new(0, 0.18, 0) },
+        { limb = "Torso", piece = "SenjuCollar", c0 = CFrame.new(0, 1.18, 0.05) },
+        { limb = "Right Arm", piece = "SenjuRightShoulder", c0 = CFrame.new(0.105, 0.99, 0) },
+        { limb = "Left Arm", piece = "SenjuLeftShoulder", c0 = CFrame.new(-0.105, 0.99, 0) * CFrame.Angles(0, 3.141592653589793, 0) },
+        { limb = "Right Leg", piece = "SenjuRightLeg", c0 = CFrame.new(0.46, 0.57, 0) },
+        { limb = "Left Leg", piece = "SenjuLeftLeg", c0 = CFrame.new(-0.46, 0.57, 0) },
+    },
+    ["Ascended Brawler's Outfit"] = {
+        { limb = "Torso", piece = "torso", c0 = CFrame.new(0, -0.04, -0.07) * CFrame.Angles(0, -1.5707963267948966, 0) },
+        { limb = "Left Arm", piece = "lefthand", c0 = CFrame.new(-0.02, -0.68, 0.01) * CFrame.Angles(0, -1.5707963267948966, 0) },
+        { limb = "Right Arm", piece = "righthand", c0 = CFrame.new(0.02, -0.68, -0.01) * CFrame.Angles(0, -1.5707963267948966, 0) },
+        { limb = "Left Arm", piece = "leftshoulder", c0 = CFrame.new(-0.41, 0.53, 0) * CFrame.Angles(0, -1.5707963267948966, 0) },
+        { limb = "Right Arm", piece = "rightshoulder", c0 = CFrame.new(0.41, 0.53, 0) * CFrame.Angles(0, -1.5707963267948966, 0) },
+        { limb = "Left Leg", piece = "leftleg", c0 = CFrame.new(-0.39, 0.46, 0) * CFrame.Angles(0, -1.5707963267948966, 0) },
+        { limb = "Right Leg", piece = "rightleg", c0 = CFrame.new(0.39, 0.46, 0) * CFrame.Angles(0, -1.5707963267948966, 0) },
+    },
+    ["Ascended Fighter's Outfit"] = {
+        { limb = "Torso", piece = "TorsoMain", c0 = CFrame.new(0, 0.05, 0) },
+        { limb = "Left Arm", piece = "LeftArm", c0 = CFrame.new(0, 0.37, 0) },
+        { limb = "Left Arm", piece = "LeftBandage", c0 = CFrame.new(0, -0.64, 0) },
+        { limb = "Right Arm", piece = "RightArm", c0 = CFrame.new(0, 0.37, 0) },
+        { limb = "Right Arm", piece = "RightBandage", c0 = CFrame.new(0, -0.64, 0) },
+        { limb = "Left Leg", piece = "LeftLeg", c0 = CFrame.new(0, 0.39, 0) },
+        { limb = "Right Leg", piece = "RightLeg", c0 = CFrame.new(0, 0.39, 0) },
+        { limb = "Left Leg", piece = "LeftWrap", c0 = CFrame.new(0, -0.49, 0) },
+        { limb = "Right Leg", piece = "RightWrap", c0 = CFrame.new(0, -0.49, 0) },
+        { limb = "Left Leg", piece = "LeftSandal", c0 = CFrame.new(0, -0.89, 0) },
+        { limb = "Right Leg", piece = "RightSandal", c0 = CFrame.new(0, -0.89, 0) },
+    },
+    ["Ascended Moon Rags"] = {
+        { limb = "Left Arm", piece = "LeftArm", c0 = CFrame.new(0, 0.03, 0.18) },
+        { limb = "Right Arm", piece = "RightArm", c0 = CFrame.new(0, 0.03, 0.18) },
+        { limb = "Torso", piece = "TorsoMain", c0 = CFrame.new(0, 0.25, 0.01) },
+        { limb = "Torso", piece = "TorsoSkirt", c0 = CFrame.new(0, -1, 0) },
+        { limb = "Torso", piece = "TorsoBand", c0 = CFrame.new(0, -0.86, 0) },
+        { limb = "Left Leg", piece = "LeftSandal", c0 = CFrame.new(0, -0.93, -0.07) },
+        { limb = "Left Leg", piece = "LeftLowerLeg", c0 = CFrame.new(0, -0.55, 0) },
+        { limb = "Left Leg", piece = "LeftLeg", c0 = CFrame.new(0, 0.34, -0.01) },
+        { limb = "Right Leg", piece = "RightSandal", c0 = CFrame.new(0, -0.93, -0.07) },
+        { limb = "Right Leg", piece = "RightLowerLeg", c0 = CFrame.new(0, -0.55, 0) },
+        { limb = "Right Leg", piece = "RightLeg", c0 = CFrame.new(0, 0.34, -0.01) },
+    },
+    ["Ascended Peacemaker"] = {
+        { limb = "Torso", piece = "TorsoPart", c0 = CFrame.new(0, -0.05, 0) },
+        { limb = "Right Arm", piece = "RightArm", c0 = CFrame.new(0, 0.6, 0) },
+        { limb = "Left Arm", piece = "LeftArm", c0 = CFrame.new(0, 0.6, 0) * CFrame.Angles(0, 3.141592653589793, 0) },
+        { limb = "Right Leg", piece = "RightLeg", c0 = CFrame.new(0, 0, 0) * CFrame.Angles(0, 3.141592653589793, 0) },
+        { limb = "Left Leg", piece = "LeftLeg", c0 = CFrame.new(0, 0, 0) * CFrame.Angles(0, 3.141592653589793, 0) },
+    },
+    ["Ascended Reanimated Cloak"] = {
+        { limb = "Torso", piece = "RootPart", c0 = CFrame.new(0, -1.5, -0.14) },
+        { limb = "Right Arm", piece = "RightArm", c0 = CFrame.new(0, 0.1, 0) * CFrame.Angles(1.5707963267948966, 0, 0) },
+        { limb = "Left Arm", piece = "LeftArm", c0 = CFrame.new(0, 0.1, 0) * CFrame.Angles(1.5707963267948966, 0, 0) },
+    },
+    ["Ascended Senju Armor"] = {
+        { limb = "Torso", piece = "SenjuTorso", c0 = CFrame.new(0, 0.18, 0) },
+        { limb = "Torso", piece = "SenjuCollar", c0 = CFrame.new(0, 1.18, 0.05) },
+        { limb = "Right Arm", piece = "SenjuRightShoulder", c0 = CFrame.new(0.105, 0.99, 0) },
+        { limb = "Left Arm", piece = "SenjuLeftShoulder", c0 = CFrame.new(-0.105, 0.99, 0) * CFrame.Angles(0, 3.141592653589793, 0) },
+        { limb = "Right Leg", piece = "SenjuRightLeg", c0 = CFrame.new(0.46, 0.57, 0) },
+        { limb = "Left Leg", piece = "SenjuLeftLeg", c0 = CFrame.new(-0.46, 0.57, 0) },
+    },
+    ["Ascended Slithering Outfit"] = {
+        { limb = "Left Arm", piece = "LeftArm", c0 = CFrame.new(0, 0.112, 0) * CFrame.Angles(0, 3.141592653589793, 0) },
+        { limb = "Left Arm", piece = "LeftUpperArm", c0 = CFrame.new(-0.002, 0.59, 0) * CFrame.Angles(0, 3.141592653589793, 0) },
+        { limb = "Right Arm", piece = "RightArm", c0 = CFrame.new(0, 0.112, 0) * CFrame.Angles(0, 3.141592653589793, 0) },
+        { limb = "Right Arm", piece = "RightUpperArm", c0 = CFrame.new(0.008, 0.59, 0) * CFrame.Angles(0, 3.141592653589793, 0) },
+        { limb = "Torso", piece = "TorsoMain", c0 = CFrame.new(0, -0.321, 0.02) * CFrame.Angles(0, 3.141592653589793, 0) },
+        { limb = "Torso", piece = "TorsoCover", c0 = CFrame.new(0, 0, 0) },
+        { limb = "Torso", piece = "Neck", c0 = CFrame.new(0, 0.795, -0.015) * CFrame.Angles(0, 3.141592653589793, 0) },
+        { limb = "Left Leg", piece = "LeftSandal", c0 = CFrame.new(0, -0.92, 0) * CFrame.Angles(0, 3.141592653589793, 0) },
+        { limb = "Left Leg", piece = "LeftLowerLeg", c0 = CFrame.new(0, -0.7, 0) * CFrame.Angles(0, 3.141592653589793, 0) },
+        { limb = "Left Leg", piece = "LeftLeg", c0 = CFrame.new(0, 0.19, 0) * CFrame.Angles(0, 3.141592653589793, 0) },
+        { limb = "Right Leg", piece = "RightSandal", c0 = CFrame.new(0, -0.92, 0) * CFrame.Angles(0, 3.141592653589793, 0) },
+        { limb = "Right Leg", piece = "RightLowerLeg", c0 = CFrame.new(0, -0.7, 0) * CFrame.Angles(0, 3.141592653589793, 0) },
+        { limb = "Right Leg", piece = "RightLeg", c0 = CFrame.new(0, 0.19, 0) * CFrame.Angles(0, 3.141592653589793, 0) },
+    },
+    ["Ascended Thunder Cloak"] = {
+        { limb = "Torso", piece = "RootPart", c0 = CFrame.new(0, -3, 0) },
+        { limb = "Right Arm", piece = "RightArm", c0 = CFrame.new(0, 0.55, 0) * CFrame.Angles(0, 0, 0) },
+        { limb = "Left Arm", piece = "LeftArm", c0 = CFrame.new(0, 0.55, 0) * CFrame.Angles(0, 0, 0) },
+    },
+    ["Ascended Wanderer's Outfit"] = {
+        { limb = "Torso", piece = "Main", c0 = CFrame.new(0, 0.24, 0.02) * CFrame.Angles(0, -1.5707963267948966, 0) },
+    },
+}
+
+local Cloth = {
+    enabled   = false,
+    selected  = "",
+    origShirt = nil,
+    origPants = nil,
+    applied   = nil,   -- the ascended Model we parented, if any
+    conn      = nil,
+    status    = nil,
+    ascended  = false,
+    hidden    = {},   -- [part or decal] = its Transparency before we hid it
+}
+
+local ASC = "Ascended "
+
+-- The client strips the prefix before looking an ascended outfit up, which is
+-- why ReplicatedStorage.Clothing only ever holds the plain names.
+local function clothingBase(name)
+    if name:sub(1, #ASC) == ASC then
+        return name:sub(#ASC + 1)
+    end
+    return name
+end
+
+local function clothingFolder()
+    return RepStorage:FindFirstChild("Clothing")
+end
+
+-- Anything humanoid that might be wearing an ascended outfit: players first,
+-- then top-level workspace models, which covers the NPCs. Deliberately not a
+-- full descendant walk - this runs on a button press, not per frame.
+local function wearers()
+    local out, seen = {}, {}
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local c = plr.Character
+        if c and not seen[c] then
+            seen[c] = true
+            out[#out + 1] = c
+        end
+    end
+
+    for _, obj in ipairs(workspace:GetChildren()) do
+        if obj:IsA("Model") and not seen[obj] and obj:FindFirstChildOfClass("Humanoid") then
+            seen[obj] = true
+            out[#out + 1] = obj
+        end
+    end
+
+    return out
+end
+
+-- [outfit name] = the character we can copy it from.
+local function ascendedDonors()
+    local found = {}
+    for _, c in ipairs(wearers()) do
+        if c ~= character() then
+            for _, child in ipairs(c:GetChildren()) do
+                if child:IsA("Model") and child.Name:sub(1, #ASC) == ASC and not found[child.Name] then
+                    found[child.Name] = child
+                end
+            end
+        end
+    end
+    return found
+end
+
+local function clothingOptions()
+    local names, seen = {}, {}
+
+    -- Base outfits only. The ascended variants used to sit in here as separate
+    -- entries, which doubled the list to say one bit of information; they are
+    -- the Ascended toggle now.
+    local folder = clothingFolder()
+    if folder then
+        for _, item in ipairs(folder:GetChildren()) do
+            local name = item.Name
+            if name:sub(1, #ASC) ~= ASC and not seen[name] then
+                seen[name] = true
+                names[#names + 1] = name
+            end
+        end
+    end
+
+    table.sort(names)
+    return names
+end
+
+-- Does this outfit have an ascended version at all? 27 of the 62 do, so the
+-- toggle cannot simply prepend the prefix and hope.
+local function hasAscended(base)
+    local want = ASC .. base
+    for _, name in ipairs(ASCENDED_NAMES) do
+        if name == want then return true end
+    end
+    return false
+end
+
+-- What the toggle and the dropdown add up to.
+local function effectiveOutfit()
+    if Cloth.ascended and Cloth.selected ~= "" and hasAscended(Cloth.selected) then
+        return ASC .. Cloth.selected
+    end
+    return Cloth.selected
+end
+
+---------------------------------------------------------------------
+-- Textures
+---------------------------------------------------------------------
+local function applyTextures(name)
+    local c    = character()
+    local data = clothingFolder()
+    data = data and data:FindFirstChild(clothingBase(name))
+    if not c or not data then return false end
+
+    local newShirt = data:FindFirstChild("Shirt")
+    local newPants = data:FindFirstChild("Pants")
+
+    if newShirt then
+        local shirt = c:FindFirstChildOfClass("Shirt")
+        if not shirt then
+            shirt = Instance.new("Shirt")
+            shirt.Parent = c
+        end
+        -- Captured once, on the first apply, so flipping between outfits while
+        -- the toggle is on cannot overwrite what we started in.
+        if Cloth.origShirt == nil then Cloth.origShirt = shirt.ShirtTemplate end
+        shirt.ShirtTemplate = newShirt.ShirtTemplate
+    end
+
+    if newPants then
+        local pants = c:FindFirstChildOfClass("Pants")
+        if not pants then
+            pants = Instance.new("Pants")
+            pants.Parent = c
+        end
+        if Cloth.origPants == nil then Cloth.origPants = pants.PantsTemplate end
+        pants.PantsTemplate = newPants.PantsTemplate
+    end
+
+    return newShirt ~= nil or newPants ~= nil
+end
+
+local function restoreTextures()
+    local c = character()
+    if c then
+        local shirt = c:FindFirstChildOfClass("Shirt")
+        local pants = c:FindFirstChildOfClass("Pants")
+        if shirt and Cloth.origShirt then shirt.ShirtTemplate = Cloth.origShirt end
+        if pants and Cloth.origPants then pants.PantsTemplate = Cloth.origPants end
+    end
+    Cloth.origShirt = nil
+    Cloth.origPants = nil
+end
+
+---------------------------------------------------------------------
+-- Geometry
+---------------------------------------------------------------------
+local function selfRigged(name)
+    for _, pat in ipairs(SELF_RIGGED) do
+        if name:find(pat, 1, true) then return true end
+    end
+    return false
+end
+
+-- [piece name] = { limb, c0, c1 }, read straight off a wearer's own joints.
+local function readPlacement(donor)
+    local map, n = {}, 0
+    for _, d in ipairs(donor:GetDescendants()) do
+        if (d:IsA("Weld") or d:IsA("Motor6D")) and d.Part0 and d.Part1 then
+            map[d.Part1.Name] = { limb = d.Part0.Name, c0 = d.C0, c1 = d.C1 }
+            n = n + 1
+        end
+    end
+    return map, n
+end
+
+-- The model, from wherever it can be had. The replicated folder is tried first
+-- because it works in an empty server; a wearer is the fallback.
+-- Normal / Broken is what the server reads, but a replicated mirror does not
+-- have to be laid out identically, and an outfit that silently "does not load"
+-- is usually geometry sitting one level away from where it was looked for. So
+-- the search widens instead of giving up: the named variants first, then any
+-- child that actually contains parts, then the entry itself.
+local function geometryUnder(entry)
+    if not entry then return nil end
+
+    local named = entry:FindFirstChild("Normal") or entry:FindFirstChild("Broken")
+    if named and named:FindFirstChildWhichIsA("BasePart", true) then
+        return named, named.Name
+    end
+
+    -- Parts straight under the entry, with no wrapper.
+    if entry:FindFirstChildWhichIsA("BasePart") then
+        return entry, "entry"
+    end
+
+    -- Some other wrapper: take the first child that holds parts, ignoring the
+    -- Shirt / Pants the textures live in.
+    for _, child in ipairs(entry:GetChildren()) do
+        if not child:IsA("Shirt") and not child:IsA("Pants")
+           and child:FindFirstChildWhichIsA("BasePart", true) then
+            return child, child.Name
+        end
+    end
+
+    return nil
+end
+
+local function outfitGeometry(name)
+    local folder = clothingFolder()
+    local entry  = folder and folder:FindFirstChild(name)
+
+    local model, where = geometryUnder(entry)
+    if model then return model, "storage/" .. where end
+
+    -- The base entry can carry the geometry for its ascended variant, since
+    -- the two share everything but the stat line.
+    if name:sub(1, #ASC) == ASC then
+        local base = folder and folder:FindFirstChild(clothingBase(name))
+        model, where = geometryUnder(base)
+        if model then return model, "storage/base/" .. where end
+    end
+
+    local donor = ascendedDonors()[name]
+    if donor then return donor, "wearer" end
+
+    return nil
+end
+
+local function removeAscended()
+    if Cloth.applied then
+        pcall(function() Cloth.applied:Destroy() end)
+        Cloth.applied = nil
+    end
+end
+
+---------------------------------------------------------------------
+-- The outfit we are already wearing
+--
+-- If the character is genuinely in an ascended outfit, the server has already
+-- welded that geometry into it. Swapping clothes locally does not take it off,
+-- so without this the two outfits are worn at once and clip through each
+-- other - and a plain outfit would still leave the old 3D armour on.
+--
+-- insertClothing stamps the name onto the character (SetAttribute("Clothing"),
+-- gamescript2.txt:1524) and names the model after the outfit, so this is the
+-- game's own bookkeeping rather than a guess.
+--
+-- Hidden rather than destroyed: the server built those welds, and hiding gives
+-- the real outfit back the moment the toggle goes off instead of making a
+-- respawn the only way to undo it.
+---------------------------------------------------------------------
+local function wornGeometry(c)
+    local found = {}
+
+    local function add(model)
+        if not model or not model:IsA("Model") or model == Cloth.applied then return end
+        for _, m in ipairs(found) do
+            if m == model then return end
+        end
+        found[#found + 1] = model
+    end
+
+    add(c:FindFirstChild(c:GetAttribute("Clothing") or ""))
+
+    -- Belt and braces, for a mid-swap frame or a Broken variant that has been
+    -- renamed back to its base name.
+    for _, child in ipairs(c:GetChildren()) do
+        if child.Name:sub(1, #ASC) == ASC then add(child) end
+    end
+
+    return found
+end
+
+local function hideWorn(c)
+    for _, model in ipairs(wornGeometry(c)) do
+        for _, d in ipairs(model:GetDescendants()) do
+            if d:IsA("BasePart") or d:IsA("Decal") or d:IsA("Texture") then
+                -- Recorded once, so applying twice cannot save 1 as "original".
+                if Cloth.hidden[d] == nil then
+                    Cloth.hidden[d] = d.Transparency
+                end
+                d.Transparency = 1
+            end
+        end
+    end
+end
+
+local function restoreWorn()
+    for obj, value in pairs(Cloth.hidden) do
+        pcall(function() obj.Transparency = value end)
+    end
+    Cloth.hidden = {}
+end
+
+---------------------------------------------------------------------
+-- Rigging
+--
+-- Three sources of placement, applied CUMULATIVELY: each pass only fills in
+-- pieces the previous one could not place. The first version of this bailed
+-- out of the later passes whenever the first placed anything at all, so an
+-- outfit whose model rigs half of itself through attributes left the rest
+-- unwelded and floating - which is exactly the "some parts don't attach" case.
+--
+-- Whatever is still unplaced after all three is welded to the piece it was
+-- authored next to, using the relative CFrames captured before anything moved.
+-- Decorative sub-pieces are not named in the server's weld branches at all, so
+-- without that pass they would never be attached by anything.
+---------------------------------------------------------------------
+
+-- Every BasePart in the model, grouped by name. Built once instead of walking
+-- the model for every lookup, and it keeps all parts sharing a name so a
+-- mirrored piece can take the next unused one rather than the same one twice.
+local function pieceIndex(model)
+    local byName = {}
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("BasePart") then
+            local list = byName[d.Name]
+            if list then
+                list[#list + 1] = d
+            else
+                byName[d.Name] = { d }
+            end
+        end
+    end
+    return byName
+end
+
+-- The first part of this name that nothing has welded yet.
+local function takePiece(rig, name)
+    local list = rig.byName[name]
+    if not list then return nil end
+    for _, part in ipairs(list) do
+        if not rig.welded[part] then return part end
+    end
+    return nil
+end
+
+local function attach(rig, piece, anchor, c0, c1)
+    if not piece or not anchor or anchor == piece or rig.welded[piece] then
+        return false
+    end
+
+    local weld = Instance.new("Weld")
+    weld.Part0 = anchor
+    weld.Part1 = piece
+    if c0 then weld.C0 = c0 end
+    if c1 then weld.C1 = c1 end
+    weld.Parent = piece              -- where the server puts it too
+
+    rig.welded[piece] = true
+    rig.count = rig.count + 1
+    return true
+end
+
+-- 1. the model rigs itself: the joints came with it and only need pointing at
+--    our limbs instead of whoever they were built for.
+local function rigFromAttributes(rig, c)
+    local placed, seen = 0, 0
+    for _, d in ipairs(rig.model:GetDescendants()) do
+        if d:IsA("Motor6D") or d:IsA("Weld") then
+            local want = d:GetAttribute("Part0")
+            if want then
+                seen = seen + 1
+                local limb = c:FindFirstChild(want)
+                if limb and limb:IsA("BasePart") then
+                    d.Part0 = limb
+                    if d.Part1 then
+                        rig.welded[d.Part1] = true
+                        rig.count = rig.count + 1
+                    end
+                    placed = placed + 1
+                else
+                end
+            end
+        end
+    end
+    return placed
+end
+
+-- 2. offsets from the table lifted out of the server.
+local function rigFromTable(rig, c, entries)
+    local placed = 0
+    for _, e in ipairs(entries) do
+        local limb = c:FindFirstChild(e.limb)
+        local piece = takePiece(rig, e.piece)
+
+        -- A mirrored piece ships once and is copied for the other side.
+        if e.clone and not piece then
+            local src = rig.byName[e.piece] and rig.byName[e.piece][1]
+            if src then
+                local copy = src:Clone()
+                for _, d in ipairs(copy:GetDescendants()) do
+                    if d:IsA("Weld") or d:IsA("Motor6D") then d:Destroy() end
+                end
+                copy.Name   = e.piece
+                copy.Parent = rig.model
+                rig.authored[copy] = rig.authored[src]
+                piece = copy
+            end
+        end
+
+        if piece and limb and limb:IsA("BasePart")
+           and attach(rig, piece, limb, e.c0, e.c1) then
+            placed = placed + 1
+        end
+    end
+    return placed
+end
+
+-- 3. offsets copied off a live wearer.
+local function rigFromWearer(rig, c, place)
+    local placed = 0
+    for name, info in pairs(place) do
+        local piece = takePiece(rig, name)
+        if piece then
+            -- Most pieces hang off a limb; a few hang off another piece of the
+            -- same outfit, so the outfit itself is the fallback.
+            local anchor = c:FindFirstChild(info.limb)
+            if not (anchor and anchor:IsA("BasePart")) then
+                anchor = rig.byName[info.limb] and rig.byName[info.limb][1]
+            end
+            if attach(rig, piece, anchor, info.c0, info.c1) then
+                placed = placed + 1
+            end
+        end
+    end
+    return placed
+end
+
+-- 4. anything still loose goes onto the piece it was authored beside. The
+--    authored CFrames were captured before any welding moved a part, so the
+--    offset between them is the placement the model was built with.
+local function rigLeftovers(rig)
+    local anchors = {}
+    for part in pairs(rig.welded) do
+        if rig.authored[part] then anchors[#anchors + 1] = part end
+    end
+    if #anchors == 0 then return 0 end
+
+    local loose = {}
+    for _, list in pairs(rig.byName) do
+        for _, part in ipairs(list) do
+            if not rig.welded[part] and rig.authored[part] then
+                loose[#loose + 1] = part
+            end
+        end
+    end
+
+    local placed = 0
+    for _, part in ipairs(loose) do
+        local mine = rig.authored[part]
+        local best, bestDist
+
+        for _, anchor in ipairs(anchors) do
+            local d = (rig.authored[anchor].Position - mine.Position).Magnitude
+            if not bestDist or d < bestDist then
+                best, bestDist = anchor, d
+            end
+        end
+
+        if best and attach(rig, part, best, rig.authored[best]:Inverse() * mine) then
+            placed = placed + 1
+        end
+    end
+
+    return placed
+end
+
+local function wearAscended(name)
+    local c = character()
+    if not c then return false, "no character" end
+
+    local source, origin = outfitGeometry(name)
+    if not source then
+        return false, "no model in ReplicatedStorage and nobody here is wearing it"
+    end
+
+    -- A wearer's joints ARE the offsets, so they are read before cloning.
+    local place
+    if origin == "wearer" then place = readPlacement(source) end
+
+    local clone = source:Clone()
+    clone.Name = name
+
+    local rig = {
+        model    = clone,
+        byName   = nil,
+        welded   = {},
+        authored = {},
+        count    = 0,
+    }
+
+    -- Pieces are made weightless and non-colliding before they are parented,
+    -- so nothing drags on us in the frame between parenting and welding, and
+    -- their authored CFrames are recorded while they are still untouched.
+    -- Joints that describe themselves are kept and re-pointed; the rest are
+    -- rebuilt, since their Part0 still refers to whoever the model was for.
+    local parts = 0
+    for _, d in ipairs(clone:GetDescendants()) do
+        if d:IsA("BasePart") then
+            rig.authored[d] = d.CFrame
+            d.Anchored   = false
+            d.CanCollide = false
+            d.Massless   = true
+            parts = parts + 1
+        elseif d:IsA("Weld") or d:IsA("Motor6D") then
+            if d:GetAttribute("Part0") == nil then d:Destroy() end
+        end
+    end
+    rig.byName = pieceIndex(clone)
+
+    rigFromAttributes(rig, c)
+
+    local entries = CLOTH_WELDS[name] or CLOTH_WELDS[(name:gsub(" Broken$", ""))]
+    if entries then rigFromTable(rig, c, entries) end
+    if place then rigFromWearer(rig, c, place) end
+    rigLeftovers(rig)
+
+    if rig.count == 0 then
+        clone:Destroy()
+        if origin:sub(1, 7) == "storage" then
+            -- A self-rigging outfit that would not rig means the replicated
+            -- copy is missing the Motor6Ds the server relies on, which is
+            -- worth saying apart from simply having no offsets for it.
+            if selfRigged(name) then
+                return false, "model found but its rigging is missing - needs a wearer"
+            end
+            return false, "found the model but no offsets for it - needs a wearer"
+        end
+        return false, "could not rig it"
+    end
+
+    removeAscended()
+    clone.Parent  = c
+    Cloth.applied = clone
+
+    -- Partial success is still worth saying: the outfit will look wrong rather
+    -- than absent, and the debug toggle names the pieces that missed.
+    if rig.count < parts then
+        return true, string.format("%d of %d pieces placed", rig.count, parts)
+    end
+    return true
+end
+
+---------------------------------------------------------------------
+-- Apply / clear
+---------------------------------------------------------------------
+local function clothApply(announce)
+    if not Cloth.enabled or Cloth.selected == "" then return end
+
+    removeAscended()
+
+    local c = character()
+    if c then hideWorn(c) end
+
+    local want = effectiveOutfit()
+
+    -- Asking for ascended on an outfit that has no ascended version is worth
+    -- saying rather than silently handing back the plain one.
+    if announce and Cloth.ascended and want == Cloth.selected then
+        notify("Clothing", Cloth.selected .. " has no ascended version", 4)
+    end
+
+    local ok = applyTextures(want)
+
+    -- An ascended pick wears the base textures underneath, exactly as the game
+    -- does, and then the geometry on top. If the geometry cannot be had the
+    -- textures still land, so the outfit is at least half right.
+    if want:sub(1, #ASC) == ASC then
+        local worn, why = wearAscended(want)
+        if not worn then
+            if announce then
+                notify("Clothing", want .. ": " .. why, 5)
+            end
+            return
+        end
+        -- A partial rig is worth saying out loud: the outfit will look wrong
+        -- rather than absent, so the count says how wrong.
+        if why and announce then
+            notify("Clothing", want .. ": " .. why, 5)
+        end
+    end
+
+    if announce then
+        if ok or Cloth.applied then
+            notify("Clothing", "Wearing " .. want, 3)
+        else
+            notify("Clothing", "Nothing to apply for " .. want, 4)
+        end
+    end
+end
+
+local function clothClear()
+    removeAscended()
+    restoreWorn()
+    restoreTextures()
+end
+
+---------------------------------------------------------------------
+-- UI
+---------------------------------------------------------------------
+UI.playerClothing.element("Dropdown", "Outfit", {
+    options = clothingOptions(),
+}, function(v)
+    Cloth.selected = v.Dropdown or ""
+    if Cloth.enabled then clothApply(true) end
+end)
+
+UI.playerClothing.element("Toggle", "Ascended", nil, function(v)
+    Cloth.ascended = v.Toggle
+    if Cloth.enabled then clothApply(true) end
+end)
+
+UI.playerClothing.element("Toggle", "Change Clothing", nil, function(v)
+    Cloth.enabled = v.Toggle
+
+    if v.Toggle then
+        if Cloth.selected == "" then
+            notify("Clothing", "Pick an outfit first")
+            return
+        end
+
+        clothApply(true)
+
+        -- A respawn arrives with the server's own outfit on, so it has to be
+        -- redone; one frame of grace lets the character finish assembling.
+        if not Cloth.conn then
+            Cloth.conn = bind(LP.CharacterAdded:Connect(function()
+                -- Every part from the old character is gone, so the saved
+                -- transparencies and templates refer to nothing.
+                Cloth.applied   = nil
+                Cloth.origShirt = nil
+                Cloth.origPants = nil
+                Cloth.hidden    = {}
+                task.delay(1.5, function()
+                    if Cloth.enabled then clothApply(false) end
+                end)
+            end))
+        end
+    else
+        if Cloth.conn then
+            unbind(Cloth.conn)
+            Cloth.conn = nil
+        end
+        clothClear()
+    end
+end)
+
+
+end
+
+yield(true)
+
 ---------------------------------------------------------------------
 -- ESP
 --
@@ -3403,7 +4637,6 @@ end
 
 local ESP = {
     enabled          = false,
-    method           = "V1",   -- V1 = Drawing overlay, V2 = BillboardGui
     showName         = true,
     showDistance     = true,
     showHealthText   = true,
@@ -3419,12 +4652,9 @@ local ESP = {
     showHighlight    = false,
     showCombatTimer  = false,
     showCooldowns    = false,
-    showArrows       = false,
     teamCheck        = false,
 
     maxCooldowns     = 3,
-    arrowOffset      = 150,
-    arrowSize        = 15,
 
     maxDistance      = 2000,
     barDistance      = 150,
@@ -3445,7 +4675,6 @@ local ESP = {
     clanColor        = Color3.fromRGB(190, 160, 255),
     combatColor      = Color3.fromRGB(255, 120, 120),
     cooldownColor    = Color3.fromRGB(170, 170, 255),
-    arrowColor       = Color3.fromRGB(152, 84, 255),
     freshieColor     = Color3.fromRGB(120, 200, 255),
     awakenedColor    = Color3.fromRGB(255, 190, 90),
 }
@@ -3474,10 +4703,6 @@ local MOB = {
     highlightOutline = Color3.fromRGB(255, 255, 255),
 }
 
--- Assigned by the V2 block further down. Declared here so the shared render
--- loop can call into it without the two halves having to be interleaved.
-local renderV2, clearV2, hideV1Labels
-
 local espObjects = {}   -- [Player] = drawings
 local mobObjects = {}   -- [Model]  = drawings
 local espConn    = nil
@@ -3501,13 +4726,18 @@ local function lerpColor(a, b, t)
     )
 end
 
-local function healthColor(pct)
+-- The five functions below run per player per frame from the ESP renderers,
+-- which are themselves not virtualised. The macro applies per function, not to
+-- everything a function calls, so without it here the hot loop would just be
+-- making virtualised calls and the win would mostly evaporate. All five are
+-- arithmetic and Drawing writes - nothing a dumper would learn from.
+local healthColor = LPH_NO_VIRTUALIZE(function(pct)
     pct = math.clamp(pct, 0, 1)
     if pct >= 0.5 then
         return lerpColor(HP_MID, HP_HIGH, (pct - 0.5) * 2)
     end
     return lerpColor(HP_LOW, HP_MID, pct * 2)
-end
+end)
 
 ---------------------------------------------------------------------
 -- DRAWING LIFECYCLE
@@ -3526,7 +4756,7 @@ local function destroyDrawings(data)
     end
 end
 
-local function hideDrawings(data)
+local hideDrawings = LPH_NO_VIRTUALIZE(function(data)
     if not data then return end
     for key, obj in pairs(data) do
         if key == "Highlight" then
@@ -3538,7 +4768,7 @@ local function hideDrawings(data)
             pcall(function() obj.Visible = false end)
         end
     end
-end
+end)
 
 local function textDrawing(size)
     return newDrawing("Text", {
@@ -3567,10 +4797,6 @@ local function createPlayerDrawings(target)
         StatusTag   = textDrawing(12),
         CombatTag   = textDrawing(12),
         CooldownTag = textDrawing(12),
-
-        -- Triangle is not implemented by every executor, so this may come
-        -- back nil; every use of it is guarded.
-        Arrow       = newDrawing("Triangle", {Thickness = 1, Filled = true, Color = Color3.fromRGB(152, 84, 255), Visible = false}),
 
         Box         = newDrawing("Square", {Thickness = 1, Filled = false, Color = Color3.new(1, 1, 1), Visible = false}),
         Tracer      = newDrawing("Line",   {Thickness = 1, Color = Color3.new(1, 1, 1), Visible = false}),
@@ -3602,14 +4828,21 @@ local function createMobDrawings(model)
     }
 end
 
+-- Cleared in place, not replaced: renderPlayerESP is a native closure and
+-- holds espObjects by value, so swapping in a fresh table would leave it
+-- drawing from the old one forever.
 local function clearPlayerESP()
-    for _, data in pairs(espObjects) do destroyDrawings(data) end
-    espObjects = {}
+    for target, data in pairs(espObjects) do
+        destroyDrawings(data)
+        espObjects[target] = nil
+    end
 end
 
 local function clearMobESP()
-    for _, data in pairs(mobObjects) do destroyDrawings(data) end
-    mobObjects = {}
+    for model, data in pairs(mobObjects) do
+        destroyDrawings(data)
+        mobObjects[model] = nil
+    end
 end
 
 ---------------------------------------------------------------------
@@ -3674,7 +4907,7 @@ end
 -- now. Names only: the game does not replicate the remaining time, and
 -- guessing it from a hardcoded duration table drifts every balance patch.
 local function cooldownsOf(target, limit)
-    local folder = RepStorage:FindFirstChild("Cooldowns")
+    local folder = cooldownsFolder()
     local mine   = folder and folder:FindFirstChild(target.Name)
     if not mine then return nil end
 
@@ -3740,7 +4973,7 @@ end
 -- One vertical bar drawn at barX. The caller walks barX leftward so the bars
 -- stack outward from the box edge in a fixed order.
 ---------------------------------------------------------------------
-local function drawBar(bg, fill, barX, barY, barW, barH, pct, color)
+local drawBar = LPH_NO_VIRTUALIZE(function(bg, fill, barX, barY, barW, barH, pct, color)
     bg.Visible  = true
     bg.Position = Vector2.new(barX, barY)
     bg.Size     = Vector2.new(barW, barH)
@@ -3750,41 +4983,12 @@ local function drawBar(bg, fill, barX, barY, barW, barH, pct, color)
     fill.Position = Vector2.new(barX, barY + (barH - fillH))
     fill.Size     = Vector2.new(barW, fillH)
     fill.Color    = color
-end
+end)
 
-local function hideBar(bg, fill)
+local hideBar = LPH_NO_VIRTUALIZE(function(bg, fill)
     bg.Visible   = false
     fill.Visible = false
-end
-
----------------------------------------------------------------------
--- OFF-SCREEN ARROWS
---
--- Direction is taken in camera object space, so a target in front of the
--- camera (negative Z) puts the arrow at the top of the ring and one behind
--- puts it at the bottom, with no special casing for the wrap-around.
----------------------------------------------------------------------
-local function drawArrow(arrow, cam, worldPos, color, offset, size)
-    if not arrow then return end
-
-    local rel = cam.CFrame:PointToObjectSpace(worldPos)
-    local flat = Vector2.new(rel.X, rel.Z)
-    if flat.Magnitude < 0.001 then
-        arrow.Visible = false
-        return
-    end
-
-    local dir    = flat.Unit
-    local centre = cam.ViewportSize / 2
-    local at     = centre + dir * offset
-    local perp   = Vector2.new(-dir.Y, dir.X)
-
-    arrow.Visible = true
-    arrow.Color   = color
-    arrow.PointA  = at + dir * size
-    arrow.PointB  = at - dir * size * 0.5 + perp * size * 0.6
-    arrow.PointC  = at - dir * size * 0.5 - perp * size * 0.6
-end
+end)
 
 local function tracerOrigin(mode, viewport)
     if mode == "Top" then
@@ -3796,9 +5000,71 @@ local function tracerOrigin(mode, viewport)
 end
 
 ---------------------------------------------------------------------
--- PLAYER ESP RENDER
+-- PER-TARGET INFO CACHE
+--
+-- The render loop used to call eight separate lookups per player per frame -
+-- team, clan, skill, awakening, freshie, combat timer, blood, cooldowns - and
+-- every one of them walks a FindFirstChild chain through ReplicatedStorage,
+-- with GetChildren() allocating a throwaway table on top. At twenty players
+-- and 144fps that is tens of thousands of instance lookups a second, to
+-- produce text that changes a few times a second at most.
+--
+-- None of it is frame-coupled, so it moves onto a timer and the loop reads the
+-- cache instead. Geometry stays per-frame, because that genuinely does move
+-- every frame; text does not. The per-target table is reused rather than
+-- rebuilt, so a refresh allocates nothing either.
+--
+-- Each field is still gated on its own toggle, so a disabled row costs no
+-- lookup even at refresh time.
 ---------------------------------------------------------------------
-local function renderPlayerESP()
+local INFO_INTERVAL = 0.12
+local infoCache     = {}
+
+local targetInfo = LPH_NO_VIRTUALIZE(function(target, char)
+    local info = infoCache[target]
+    if not info then
+        info = { at = 0 }
+        infoCache[target] = info
+    end
+
+    local now = os.clock()
+    if now - info.at < INFO_INTERVAL then return info end
+    info.at = now
+
+    info.team      = isTeammate(target)
+    info.clan      = ESP.showClan        and bloodlineOf(target) or nil
+    info.blood     = ESP.showBloodBar    and bloodPct(target) or nil
+    info.cooldowns = ESP.showCooldowns   and cooldownsOf(target, ESP.maxCooldowns) or nil
+    info.combat    = ESP.showCombatTimer and combatTimerOf(target) or nil
+
+    -- One status row carries skill / awakening / freshie, worst-first, so the
+    -- stack never grows past four lines.
+    local status, statusColor = nil, nil
+    if ESP.showSkill then
+        local skill = skillOf(target)
+        if skill then status, statusColor = skill, ESP.awakenedColor end
+    end
+    if not status and ESP.showAwakened then
+        local mode = awakenedOf(target)
+        if mode then status, statusColor = mode, ESP.awakenedColor end
+    end
+    if not status and ESP.showFreshie and isFreshie(char) then
+        status, statusColor = "Freshie", ESP.freshieColor
+    end
+    info.status      = status
+    info.statusColor = statusColor
+
+    return info
+end)
+
+---------------------------------------------------------------------
+-- PLAYER ESP RENDER
+--
+-- Not virtualised: the hottest function in the script, running every frame
+-- for every player, and it holds nothing but maths and Drawing writes - there
+-- is nothing here a dumper would learn anything from.
+---------------------------------------------------------------------
+local renderPlayerESP = LPH_NO_VIRTUALIZE(function()
     if not ESP.enabled then return end
 
     local cam = workspace.CurrentCamera
@@ -3808,7 +5074,11 @@ local function renderPlayerESP()
     local myPos  = myRoot and myRoot.Position
     local W2VP   = cam.WorldToViewportPoint
 
-    for _, target in ipairs(Players:GetPlayers()) do
+    -- Same value for every target, so it is computed once a frame rather than
+    -- once a frame per player.
+    local tracerFrom = ESP.showTracers and tracerOrigin(ESP.tracerOrigin, cam.ViewportSize) or nil
+
+    for _, target in ipairs(playerList()) do
         if target == LP then continue end
 
         local data = espObjects[target]
@@ -3836,20 +5106,12 @@ local function renderPlayerESP()
         end
 
         if not onScreen then
-            -- Off screen: everything hides except the arrow, which is the
-            -- whole point of the arrow.
             hideDrawings(data)
-            if ESP.showArrows then
-                drawArrow(data.Arrow, cam, hrp.Position,
-                    isTeammate(target) and ESP.teamColor or ESP.arrowColor,
-                    ESP.arrowOffset, ESP.arrowSize)
-            end
             continue
         end
 
-        if data.Arrow then data.Arrow.Visible = false end
-
-        local team      = isTeammate(target)
+        local info      = targetInfo(target, char)
+        local team      = info.team
         local boxColor  = team and ESP.teamColor or ESP.boxColor
         local nameColor = team and ESP.teamColor or ESP.nameColor
 
@@ -3873,39 +5135,6 @@ local function renderPlayerESP()
             data.Box.Visible = false
         end
 
-        -- Boxes, tracers, arrows and the highlight are shared by both
-        -- methods - only the text and the bars differ, and in V2 those are
-        -- billboards instead of Drawings.
-        if ESP.method ~= "V1" then
-            if ESP.showTracers then
-                data.Tracer.Visible = true
-                data.Tracer.From    = tracerOrigin(ESP.tracerOrigin, cam.ViewportSize)
-                data.Tracer.To      = Vector2.new(rootPos.X, rootPos.Y)
-                data.Tracer.Color   = team and ESP.teamColor or ESP.tracerColor
-            else
-                data.Tracer.Visible = false
-            end
-
-            if ESP.showHighlight then
-                if not data.Highlight then
-                    local hl = Instance.new("Highlight")
-                    hl.Name                = K.Services.HttpService:GenerateGUID(false)
-                    hl.FillTransparency    = 0.65
-                    hl.OutlineTransparency = 0
-                    hl.Adornee             = char
-                    pcall(function() hl.Parent = hiddenParent() end)
-                    data.Highlight = hl
-                end
-                data.Highlight.Adornee      = char
-                data.Highlight.FillColor    = team and ESP.teamColor or ESP.highlightFill
-                data.Highlight.OutlineColor = team and ESP.teamColor or ESP.highlightOutline
-            elseif data.Highlight then
-                pcall(function() data.Highlight:Destroy() end)
-                data.Highlight = nil
-            end
-
-            continue
-        end
 
         -----------------------------------------------------------------
         -- Bars, stacked right to left: health -> chakra -> blood.
@@ -3938,7 +5167,7 @@ local function renderPlayerESP()
         end
 
         if ESP.showBloodBar and barsInRange then
-            local pct = bloodPct(target)
+            local pct = info.blood
             if pct then
                 drawBar(data.BloodBg, data.BloodFill, barX, barY, barW, barH, pct, ESP.bloodColor)
                 barX = barX - barW - 3
@@ -3954,10 +5183,7 @@ local function renderPlayerESP()
         -----------------------------------------------------------------
         if ESP.showName then
             local label = target.Name
-            if ESP.showClan then
-                local clan = bloodlineOf(target)
-                if clan then label = label .. " [" .. clan .. "]" end
-            end
+            if info.clan then label = label .. " [" .. info.clan .. "]" end
 
             data.NameTag.Visible  = true
             data.NameTag.Position = Vector2.new(rootPos.X, boxPos.Y - 2 - ESP.textSize)
@@ -3996,24 +5222,10 @@ local function renderPlayerESP()
             data.HealthTag.Visible = false
         end
 
-        -- One status row carries freshie / awakened / current skill so the
-        -- stack never grows past four lines.
-        local status, statusColor = nil, nil
-
-        if ESP.showSkill then
-            local skill = skillOf(target)
-            if skill then status, statusColor = skill, ESP.awakenedColor end
-        end
-        if not status and ESP.showAwakened then
-            local mode = awakenedOf(target)
-            if mode then status, statusColor = mode, ESP.awakenedColor end
-        end
-        if not status and ESP.showFreshie and isFreshie(char) then
-            status, statusColor = "Freshie", ESP.freshieColor
-        end
+        local status, statusColor = info.status, info.statusColor
 
         if ESP.showCombatTimer then
-            local timer = combatTimerOf(target)
+            local timer = info.combat
             if timer and timer > 0 then
                 data.CombatTag.Visible  = true
                 data.CombatTag.Position = Vector2.new(rootPos.X, infoY)
@@ -4029,7 +5241,7 @@ local function renderPlayerESP()
         end
 
         if ESP.showCooldowns then
-            local list = cooldownsOf(target, ESP.maxCooldowns)
+            local list = info.cooldowns
             if list then
                 data.CooldownTag.Visible  = true
                 data.CooldownTag.Position = Vector2.new(rootPos.X, infoY)
@@ -4057,9 +5269,9 @@ local function renderPlayerESP()
         -----------------------------------------------------------------
         -- Tracer / highlight
         -----------------------------------------------------------------
-        if ESP.showTracers then
+        if tracerFrom then
             data.Tracer.Visible = true
-            data.Tracer.From    = tracerOrigin(ESP.tracerOrigin, cam.ViewportSize)
+            data.Tracer.From    = tracerFrom
             data.Tracer.To      = Vector2.new(rootPos.X, rootPos.Y)
             data.Tracer.Color   = team and ESP.teamColor or ESP.tracerColor
         else
@@ -4084,7 +5296,7 @@ local function renderPlayerESP()
             data.Highlight = nil
         end
     end
-end
+end)
 
 ---------------------------------------------------------------------
 -- MOB REGISTRY
@@ -4094,14 +5306,25 @@ end
 -- test is cached per model: it never changes and the check is not free.
 ---------------------------------------------------------------------
 local mobRegistry  = {}
+local mobPending   = {}   -- models still streaming in
 local dialogCache  = {}
 local mobConns     = {}
+local mobSweep     = 0
+local playerChars  = {}
+local playerCharAt = 0
 
+-- Cached: this used to walk every player for every candidate model, on every
+-- sweep. The set only changes on spawn, so a one-second refresh is plenty.
 local function isPlayerModel(model)
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p.Character == model then return true end
+    local now = os.clock()
+    if now - playerCharAt > 1 then
+        playerCharAt = now
+        playerChars = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p.Character then playerChars[p.Character] = true end
+        end
     end
-    return false
+    return playerChars[model] == true
 end
 
 local function isMob(model)
@@ -4111,6 +5334,9 @@ local function isMob(model)
     if not (model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso")) then return false end
     if isPlayerModel(model) then return false end
 
+    -- Only cached once the model has a Humanoid, i.e. once it has finished
+    -- streaming. Caching earlier can record a verdict taken before the NPC
+    -- tag replicated and then never revisit it.
     local cached = dialogCache[model]
     if cached ~= nil then return not cached end
 
@@ -4120,23 +5346,66 @@ local function isMob(model)
     return not hasDialog
 end
 
+-- A model arrives in workspace before its Humanoid and HumanoidRootPart do,
+-- and how long that takes varies per mob. The old code looked once at 0.5s and
+-- threw the model away if it was not ready yet, which is why some mobs were
+-- silently skipped until a manual rescan. Anything not yet recognisable goes
+-- on a pending list and is re-checked by the sweep below until it either
+-- qualifies or the window expires.
+local MOB_PENDING_WINDOW = 6
+
+local function considerMob(obj)
+    if mobRegistry[obj] or not obj:IsA("Model") then return end
+    if isMob(obj) then
+        mobRegistry[obj] = true
+        mobPending[obj]  = nil
+    else
+        mobPending[obj] = os.clock() + MOB_PENDING_WINDOW
+    end
+end
+
+local function sweepPending()
+    local now = os.clock()
+    if now - mobSweep < 0.25 then return end
+    mobSweep = now
+
+    for obj, deadline in pairs(mobPending) do
+        if not obj.Parent or now > deadline then
+            mobPending[obj] = nil
+        elseif isMob(obj) then
+            mobRegistry[obj] = true
+            mobPending[obj]  = nil
+        end
+    end
+end
+
 local function startMobRegistry()
-    mobRegistry = {}
+    -- In place: renderMobESP captures mobRegistry by value.
+    table.clear(mobRegistry)
+    table.clear(mobPending)
 
     for _, obj in ipairs(workspace:GetChildren()) do
-        if isMob(obj) then mobRegistry[obj] = true end
+        if obj:IsA("Model") and isMob(obj) then mobRegistry[obj] = true end
     end
 
     mobConns[#mobConns + 1] = bind(workspace.ChildAdded:Connect(function(obj)
         if not MOB.enabled then return end
-        -- Humanoid is often parented a frame or two after the model.
-        task.delay(0.5, function()
-            if not MOB.enabled or not obj.Parent then return end
-            if isMob(obj) then mobRegistry[obj] = true end
-        end)
+        considerMob(obj)
+    end))
+
+    -- Catches a Humanoid arriving in a model that is already in workspace,
+    -- which ChildAdded has long since fired for.
+    mobConns[#mobConns + 1] = bind(workspace.DescendantAdded:Connect(function(d)
+        if not MOB.enabled then return end
+        if not d:IsA("Humanoid") then return end
+        local model = d.Parent
+        if model and model.Parent == workspace then
+            considerMob(model)
+        end
     end))
 
     mobConns[#mobConns + 1] = bind(workspace.ChildRemoved:Connect(function(obj)
+        mobPending[obj] = nil
         if mobRegistry[obj] then
             mobRegistry[obj] = nil
             dialogCache[obj] = nil
@@ -4148,9 +5417,10 @@ end
 
 local function stopMobRegistry()
     for _, c in ipairs(mobConns) do unbind(c) end
-    mobConns    = {}
-    mobRegistry = {}
-    dialogCache = {}
+    mobConns = {}
+    table.clear(mobRegistry)
+    table.clear(mobPending)
+    table.clear(dialogCache)
 end
 
 ---------------------------------------------------------------------
@@ -4174,11 +5444,14 @@ local function mobSize(model)
     return Vector3.new(4, 6, 4)
 end
 
-local function renderMobESP()
+-- Not virtualised either, for the same reason as the player renderer.
+local renderMobESP = LPH_NO_VIRTUALIZE(function()
     if not MOB.enabled then return end
 
     mobFrame = mobFrame + 1
     if mobFrame % 3 ~= 0 then return end
+
+    sweepPending()
 
     local cam = workspace.CurrentCamera
     if not cam then return end
@@ -4314,7 +5587,7 @@ local function renderMobESP()
             data.Highlight = nil
         end
     end
-end
+end)
 
 ---------------------------------------------------------------------
 -- RENDER LOOP (one connection shared by both ESPs)
@@ -4323,12 +5596,27 @@ local function syncEspLoop()
     local wanted = ESP.enabled or MOB.enabled
 
     if wanted and not espConn then
+        -- Two pcalls a frame that nobody ever reads is how a broken renderer
+        -- stays broken and silent for a whole session. A few consecutive
+        -- failures are treated as a real fault: say so once, then stop drawing
+        -- rather than burning the frame budget on it.
+        local fails = 0
         espConn = bind(RunService.RenderStepped:Connect(function()
-            pcall(renderPlayerESP)
-            if ESP.enabled and ESP.method == "V2" and renderV2 then
-                pcall(renderV2)
+            local ok, err = pcall(renderPlayerESP)
+            if ok then ok, err = pcall(renderMobESP) end
+
+            if ok then
+                fails = 0
+                return
             end
-            pcall(renderMobESP)
+
+            fails = fails + 1
+            if fails >= 5 then
+                notify("Visuals", "ESP stopped: " .. tostring(err), 8)
+                ESP.enabled = false
+                MOB.enabled = false
+                task.defer(syncEspLoop)
+            end
         end))
     elseif not wanted and espConn then
         unbind(espConn)
@@ -4339,378 +5627,11 @@ end
 bind(Players.PlayerRemoving:Connect(function(target)
     destroyDrawings(espObjects[target])
     espObjects[target] = nil
+    infoCache[target]  = nil
 end))
 
 yield(true)
 
----------------------------------------------------------------------
--- ESP V2 (BillboardGui)
---
--- The same information as V1, drawn as a real GUI adorned to the target's
--- torso instead of as a screen overlay: health and chakra as filled bars with
--- the numbers inside them, blood as a thin bar underneath, then distance,
--- status, combat timer and cooldowns.
---
--- Boxes, tracers, arrows and the highlight are NOT duplicated here - those
--- stay Drawing-based and are shared by both methods, so every toggle on the
--- ESP list keeps working whichever method is selected.
---
--- Font is the UI library's (Ubuntu) throughout, applied in one sweep at the
--- end so a label added later cannot quietly miss it.
----------------------------------------------------------------------
-local V2_FONT     = Enum.Font.Ubuntu
-local espV2       = {}   -- [Player] = BillboardGui
-local espV2Adorn  = {}   -- [Player] = the torso it was built against
-
-local function v2Torso(char)
-    return char:FindFirstChild("UpperTorso")
-        or char:FindFirstChild("Torso")
-        or char:FindFirstChild("HumanoidRootPart")
-end
-
-local function v2Label(parent, name, size, color)
-    local label = Instance.new("TextLabel")
-    label.Name                   = name
-    label.Size                   = UDim2.new(1, 0, 0, size + 2)
-    label.BackgroundTransparency = 1
-    label.Font                   = V2_FONT
-    label.TextSize               = size
-    label.TextColor3             = color
-    label.TextStrokeTransparency = 0
-    label.TextStrokeColor3       = Color3.new(0, 0, 0)
-    label.Text                   = ""
-    label.Visible                = false
-    label.Parent                 = parent
-    return label
-end
-
-local function v2Bar(parent, width, height, x, y, fillColor, radius, withText)
-    local bg = Instance.new("Frame")
-    bg.Size             = UDim2.new(0, width, 0, height)
-    bg.Position         = UDim2.new(0, x, 0, y)
-    bg.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-    bg.BorderSizePixel  = 0
-    bg.Parent           = parent
-
-    local bgCorner = Instance.new("UICorner")
-    bgCorner.CornerRadius = UDim.new(0, radius)
-    bgCorner.Parent       = bg
-
-    local fill = Instance.new("Frame")
-    fill.Name             = "Fill"
-    fill.Size             = UDim2.new(1, 0, 1, 0)
-    fill.BackgroundColor3 = fillColor
-    fill.BorderSizePixel  = 0
-    fill.Parent           = bg
-
-    local fillCorner = Instance.new("UICorner")
-    fillCorner.CornerRadius = UDim.new(0, radius)
-    fillCorner.Parent       = fill
-
-    local text
-    if withText then
-        text = Instance.new("TextLabel")
-        text.Name                   = "Value"
-        text.Size                   = UDim2.new(1, 0, 1, 0)
-        text.BackgroundTransparency = 1
-        text.Font                   = V2_FONT
-        text.TextSize               = 10
-        text.TextColor3             = Color3.new(1, 1, 1)
-        text.TextStrokeTransparency = 0
-        text.TextStrokeColor3       = Color3.new(0, 0, 0)
-        text.Text                   = ""
-        text.ZIndex                 = 2
-        text.Parent                 = bg
-    end
-
-    return { bg = bg, fill = fill, text = text }
-end
-
-local function createV2(target)
-    local char  = target.Character
-    local torso = char and v2Torso(char)
-    if not torso then return nil end
-
-    local size = ESP.textSize
-
-    local billboard = Instance.new("BillboardGui")
-    billboard.Name            = K.Services.HttpService:GenerateGUID(false)
-    billboard.Adornee         = torso
-    billboard.Size            = UDim2.new(0, 170, 0, 110)
-    billboard.StudsOffset     = Vector3.new(0, 3.5, 0)
-    billboard.AlwaysOnTop     = true
-    billboard.LightInfluence  = 0
-    billboard.MaxDistance     = ESP.maxDistance
-    billboard.Parent          = hiddenParent()
-
-    local main = Instance.new("Frame")
-    main.Name                   = "Main"
-    main.Size                   = UDim2.new(1, 0, 1, 0)
-    main.BackgroundTransparency = 1
-    main.Parent                 = billboard
-
-    local parts = {
-        gui      = billboard,
-        main     = main,
-        name     = v2Label(main, "Name",     size,     ESP.nameColor),
-        info     = v2Label(main, "Info",     size - 2, ESP.distanceColor),
-        status   = v2Label(main, "Status",   size - 3, ESP.awakenedColor),
-        combat   = v2Label(main, "Combat",   size - 3, ESP.combatColor),
-        cooldown = v2Label(main, "Cooldown", size - 3, ESP.cooldownColor),
-    }
-
-    -- Bars live in their own frame so the whole block can be hidden and the
-    -- labels below it close the gap.
-    local bars = Instance.new("Frame")
-    bars.Name                   = "Bars"
-    bars.Size                   = UDim2.new(0, 130, 0, 22)
-    bars.Position               = UDim2.new(0.5, -65, 0, 0)
-    bars.BackgroundTransparency = 1
-    bars.Parent                 = main
-
-    parts.bars   = bars
-    parts.health = v2Bar(bars, 62, 14, 0,  0,  HP_HIGH,          4, true)
-    parts.chakra = v2Bar(bars, 62, 14, 68, 0,  ESP.chakraColor,  4, true)
-    parts.blood  = v2Bar(bars, 80, 4,  25, 17, ESP.bloodColor,   2, false)
-
-    for _, d in ipairs(billboard:GetDescendants()) do
-        if d:IsA("TextLabel") then
-            pcall(function() d.Font = V2_FONT end)
-        end
-    end
-
-    espV2[target]      = parts
-    espV2Adorn[target] = torso
-    return parts
-end
-
-local function destroyV2(target)
-    local parts = espV2[target]
-    if parts then
-        pcall(function() parts.gui:Destroy() end)
-        espV2[target] = nil
-    end
-    espV2Adorn[target] = nil
-end
-
--- Assigned to the forward declaration above.
-clearV2 = function()
-    for target in pairs(espV2) do destroyV2(target) end
-    espV2      = {}
-    espV2Adorn = {}
-end
-
--- Switching method leaves the other renderer's output on screen unless it is
--- explicitly put away, so both directions get a one-shot cleanup.
-hideV1Labels = function()
-    for _, data in pairs(espObjects) do
-        for _, key in ipairs({ "NameTag", "DistanceTag", "HealthTag", "StatusTag", "CombatTag", "CooldownTag" }) do
-            local obj = data[key]
-            if obj then pcall(function() obj.Visible = false end) end
-        end
-        hideBar(data.HealthBg, data.HealthFill)
-        hideBar(data.ChakraBg, data.ChakraFill)
-        hideBar(data.BloodBg,  data.BloodFill)
-    end
-end
-
----------------------------------------------------------------------
--- V2 RENDER
----------------------------------------------------------------------
-renderV2 = function()
-    if not ESP.enabled or ESP.method ~= "V2" then return end
-
-    local myRoot = root()
-    local myPos  = myRoot and myRoot.Position
-    local size   = ESP.textSize
-
-    for _, target in ipairs(Players:GetPlayers()) do
-        if target == LP then continue end
-
-        local char = target.Character
-        local hum  = char and char:FindFirstChildOfClass("Humanoid")
-        local hrp  = char and char:FindFirstChild("HumanoidRootPart")
-
-        if not hum or not hrp or hum.Health <= 0 then
-            destroyV2(target)
-            continue
-        end
-
-        local distance = myPos and (hrp.Position - myPos).Magnitude or 0
-        if distance > ESP.maxDistance then
-            local parts = espV2[target]
-            if parts then parts.gui.Enabled = false end
-            continue
-        end
-
-        -- A respawn swaps the torso out from under the adornee.
-        local torso = v2Torso(char)
-        if espV2[target] and espV2Adorn[target] ~= torso then
-            destroyV2(target)
-        end
-
-        local parts = espV2[target] or createV2(target)
-        if not parts then continue end
-
-        parts.gui.Enabled     = true
-        parts.gui.MaxDistance = ESP.maxDistance
-
-        local team      = isTeammate(target)
-        local nameColor = team and ESP.teamColor or ESP.nameColor
-        local y         = 0
-
-        -- Name (+ clan inline, as in V1)
-        if ESP.showName then
-            local label = target.Name
-            if ESP.showClan then
-                local clan = bloodlineOf(target)
-                if clan then label = label .. " [" .. clan .. "]" end
-            end
-            parts.name.Visible    = true
-            parts.name.Text       = label
-            parts.name.TextColor3 = nameColor
-            parts.name.TextSize   = size
-            parts.name.Position   = UDim2.new(0, 0, 0, y)
-            parts.name.Size       = UDim2.new(1, 0, 0, size + 2)
-            y = y + size + 2
-        else
-            parts.name.Visible = false
-        end
-
-        -- Bars
-        local hpPct  = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
-        local ckPct, ckCur, ckMax = chakraPct(target)
-        local bdPct  = bloodPct(target)
-
-        local showHp = ESP.showHealthBar
-        local showCk = ESP.showChakraBar and ckPct ~= nil
-        local showBd = ESP.showBloodBar and bdPct ~= nil
-        local anyBar = showHp or showCk or showBd
-
-        parts.bars.Visible = anyBar
-        if anyBar then
-            parts.bars.Position = UDim2.new(0.5, -65, 0, y)
-
-            parts.health.bg.Visible = showHp
-            if showHp then
-                parts.health.fill.Size            = UDim2.new(hpPct, 0, 1, 0)
-                parts.health.fill.BackgroundColor3 = healthColor(hpPct)
-                parts.health.text.Text            = string.format("%d/%d", math.floor(hum.Health), math.floor(hum.MaxHealth))
-            end
-
-            parts.chakra.bg.Visible = showCk
-            if showCk then
-                parts.chakra.fill.Size             = UDim2.new(ckPct, 0, 1, 0)
-                parts.chakra.fill.BackgroundColor3 = ESP.chakraColor
-                parts.chakra.text.Text             = string.format("%d/%d", ckCur or 0, ckMax or 100)
-            end
-
-            parts.blood.bg.Visible = showBd
-            if showBd then
-                parts.blood.fill.Size             = UDim2.new(bdPct, 0, 1, 0)
-                parts.blood.fill.BackgroundColor3 = ESP.bloodColor
-            end
-
-            -- A single row of bars is 14 tall; blood adds its own strip.
-            local barsHeight = 0
-            if showHp or showCk then barsHeight = 14 end
-            if showBd then barsHeight = barsHeight + 8 end
-            parts.bars.Size = UDim2.new(0, 130, 0, barsHeight)
-            y = y + barsHeight + 2
-        end
-
-        -- Info row: distance, plus the HP number when the bar that normally
-        -- carries it is switched off.
-        local info = {}
-        if ESP.showDistance then
-            info[#info + 1] = string.format("%d studs", math.floor(distance))
-        end
-        if ESP.showHealthText and not showHp then
-            info[#info + 1] = string.format("%d/%d HP", math.floor(hum.Health), math.floor(hum.MaxHealth))
-        end
-
-        if #info > 0 then
-            parts.info.Visible    = true
-            parts.info.Text       = table.concat(info, "  |  ")
-            parts.info.TextColor3 = ESP.distanceColor
-            parts.info.TextSize   = size - 2
-            parts.info.Position   = UDim2.new(0, 0, 0, y)
-            y = y + size
-        else
-            parts.info.Visible = false
-        end
-
-        -- Status: skill, else awakened mode, else freshie - same precedence
-        -- the V1 renderer uses.
-        local status, statusColor = nil, nil
-        if ESP.showSkill then
-            local skill = skillOf(target)
-            if skill then status, statusColor = skill, ESP.awakenedColor end
-        end
-        if not status and ESP.showAwakened then
-            local mode = awakenedOf(target)
-            if mode then status, statusColor = mode, ESP.awakenedColor end
-        end
-        if not status and ESP.showFreshie and isFreshie(char) then
-            status, statusColor = "Freshie", ESP.freshieColor
-        end
-
-        if status then
-            parts.status.Visible    = true
-            parts.status.Text       = status
-            parts.status.TextColor3 = statusColor
-            parts.status.TextSize   = size - 3
-            parts.status.Position   = UDim2.new(0, 0, 0, y)
-            y = y + size - 1
-        else
-            parts.status.Visible = false
-        end
-
-        if ESP.showCombatTimer then
-            local timer = combatTimerOf(target)
-            if timer and timer > 0 then
-                parts.combat.Visible    = true
-                parts.combat.Text       = string.format("Combat %ds", math.floor(timer))
-                parts.combat.TextColor3 = ESP.combatColor
-                parts.combat.TextSize   = size - 3
-                parts.combat.Position   = UDim2.new(0, 0, 0, y)
-                y = y + size - 1
-            else
-                parts.combat.Visible = false
-            end
-        else
-            parts.combat.Visible = false
-        end
-
-        if ESP.showCooldowns then
-            local list = cooldownsOf(target, ESP.maxCooldowns)
-            if list then
-                parts.cooldown.Visible    = true
-                parts.cooldown.Text       = list
-                parts.cooldown.TextColor3 = ESP.cooldownColor
-                parts.cooldown.TextSize   = size - 3
-                parts.cooldown.Position   = UDim2.new(0, 0, 0, y)
-                y = y + size - 1
-            else
-                parts.cooldown.Visible = false
-            end
-        else
-            parts.cooldown.Visible = false
-        end
-
-        -- Grow the billboard to whatever the stack actually needs, and keep
-        -- the block sitting above the head rather than drifting down it.
-        parts.gui.Size        = UDim2.new(0, 170, 0, math.max(y, 20))
-        parts.gui.StudsOffset = Vector3.new(0, 3.5, 0)
-    end
-
-    -- Anyone who left keeps their billboard otherwise.
-    for target in pairs(espV2) do
-        if target.Parent ~= Players then destroyV2(target) end
-    end
-end
-
-yield(true)
 
 ---------------------------------------------------------------------
 -- ESP UI
@@ -4725,34 +5646,12 @@ local function drawingAvailable()
     return false
 end
 
--- V1 draws the whole readout as a screen overlay; V2 adorns a BillboardGui to
--- the target instead. Boxes, tracers, arrows and the highlight are shared, so
--- every other toggle below applies to both.
-UI.boxPlayerESP.element("Dropdown", "ESP Method", {
-    options = { "V1", "V2" },
-    default = { Dropdown = "V1" },
-}, function(v)
-    if v.Dropdown == ESP.method then return end
-    ESP.method = v.Dropdown
-
-    -- Put the other renderer's output away, or it stays frozen on screen.
-    if ESP.method == "V2" then
-        if hideV1Labels then hideV1Labels() end
-    else
-        if clearV2 then clearV2() end
-    end
-
-    notify("Visuals", "ESP method: " .. ESP.method, 2)
-end)
-
 UI.boxPlayerESP.element("Toggle", "Enable Player ESP", nil, function(v)
-    -- V2's text is a real GUI; only the shared box/tracer layer needs Drawing.
-    if v.Toggle and ESP.method == "V1" and not drawingAvailable() then return end
+    if v.Toggle and not drawingAvailable() then return end
 
     ESP.enabled = v.Toggle
     if not v.Toggle then
         clearPlayerESP()
-        if clearV2 then clearV2() end
     end
     syncEspLoop()
     notify("Visuals", "Player ESP " .. (v.Toggle and "enabled" or "disabled"))
@@ -4846,12 +5745,6 @@ end):add_color({ Color = ESP.cooldownColor }, false, function(c)
     ESP.cooldownColor = c.Color
 end)
 
-UI.boxPlayerESP.element("Toggle", "Off-Screen Arrows", nil, function(v)
-    ESP.showArrows = v.Toggle
-end):add_color({ Color = ESP.arrowColor }, false, function(c)
-    ESP.arrowColor = c.Color
-end)
-
 yield()
 
 UI.boxPlayerESPOpt.element("Toggle", "Team Check", nil, function(v)
@@ -4903,18 +5796,6 @@ UI.boxPlayerESPOpt.element("Slider", "Max Cooldowns Shown", {
     default = { min = 1, max = 8, default = 3 },
 }, function(v)
     ESP.maxCooldowns = v.Slider
-end)
-
-UI.boxPlayerESPOpt.element("Slider", "Arrow Distance", {
-    default = { min = 50, max = 400, default = 150 },
-}, function(v)
-    ESP.arrowOffset = v.Slider
-end)
-
-UI.boxPlayerESPOpt.element("Slider", "Arrow Size", {
-    default = { min = 5, max = 30, default = 15 },
-}, function(v)
-    ESP.arrowSize = v.Slider
 end)
 
 yield()
@@ -5385,78 +6266,164 @@ local function hudRoot()
     return HUD.gui
 end
 
--- opts = { width, height, y, list }
+-- opts = { width, height, y, list, icon, label }
+--
+-- Same construction as the keybind list, because that is this script's HUD
+-- language: square corners, body 18/18/22, 1px 58/58/66 stroke, Ubuntu, and a
+-- two-stripe header - grey, then the accent - pinned to the top edge.
+--
+-- The one departure is that the accent stripe is not fixed white: it carries
+-- the panel's STATE. set_state moves the stripe, the icon tint and the value
+-- text together, so the panel's status is legible from the stripe alone,
+-- without reading a word of it.
+--
+--   ===============================   grey
+--   -------------------------------   state colour
+--    [icon] Label        State word
+--
+-- and, on hover, the names underneath in an identical box.
 local function makePanel(opts)
     local panel = { draggable = false, rows = 0 }
 
+    local W, H  = opts.width, opts.height
+    local BODY  = Color3.fromRGB(18, 18, 22)
+    local EDGE  = Color3.fromRGB(58, 58, 66)
+    local WHITE = Color3.fromRGB(255, 255, 255)
+    local DIM   = Color3.fromRGB(150, 150, 150)
+    local BAR   = 2
+
+    panel.accentColor = WHITE
+
     panel.frame = Instance.new("Frame")
-    panel.frame.Size             = UDim2.new(0, opts.width, 0, opts.height)
-    panel.frame.Position         = UDim2.new(0.5, -opts.width / 2, 0, opts.y)
-    panel.frame.BackgroundColor3 = Color3.fromRGB(18, 22, 28)
+    panel.frame.Size             = UDim2.new(0, W, 0, H)
+    panel.frame.Position         = UDim2.new(0.5, -W / 2, 0, opts.y)
+    panel.frame.BackgroundColor3 = BODY
     panel.frame.BorderSizePixel  = 0
     panel.frame.Visible          = false
     panel.frame.ZIndex           = 2
     panel.frame.Parent           = hudRoot()
 
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 10)
-    corner.Parent       = panel.frame
-
     local stroke = Instance.new("UIStroke")
-    stroke.Color     = Color3.fromRGB(152, 84, 255)
-    stroke.Thickness = 2
+    stroke.Color     = EDGE
+    stroke.Thickness = 1
     stroke.Parent    = panel.frame
+    panel.stroke = stroke
 
-    panel.left = Instance.new("TextLabel")
-    panel.left.BackgroundTransparency = 1
-    panel.left.Position       = UDim2.new(0, 12, 0, 0)
-    panel.left.Size           = UDim2.new(0.6, -16, 1, 0)
-    panel.left.Font           = Enum.Font.GothamBold
-    panel.left.TextSize       = 15
-    panel.left.TextColor3     = Color3.fromRGB(255, 255, 255)
-    panel.left.TextXAlignment = Enum.TextXAlignment.Left
-    panel.left.TextTruncate   = Enum.TextTruncate.AtEnd
-    panel.left.Text           = ""
-    panel.left.ZIndex         = 3
-    panel.left.Parent         = panel.frame
+    -- Grey rule, then the accent rule under it.
+    local grey = Instance.new("Frame")
+    grey.Size             = UDim2.new(1, 0, 0, BAR)
+    grey.BackgroundColor3 = EDGE
+    grey.BorderSizePixel  = 0
+    grey.ZIndex           = 3
+    grey.Parent           = panel.frame
 
-    panel.right = Instance.new("TextLabel")
-    panel.right.BackgroundTransparency = 1
-    panel.right.Position       = UDim2.new(0.6, 0, 0, 0)
-    panel.right.Size           = UDim2.new(0.4, -12, 1, 0)
-    panel.right.Font           = Enum.Font.GothamBold
-    panel.right.TextSize       = 14
-    panel.right.TextColor3     = Color3.fromRGB(34, 197, 94)
-    panel.right.TextXAlignment = Enum.TextXAlignment.Right
-    panel.right.Text           = ""
-    panel.right.ZIndex         = 3
-    panel.right.Parent         = panel.frame
+    local accent = Instance.new("Frame")
+    accent.Position         = UDim2.new(0, 0, 0, BAR)
+    accent.Size             = UDim2.new(1, 0, 0, BAR)
+    accent.BackgroundColor3 = panel.accentColor
+    accent.BorderSizePixel  = 0
+    accent.ZIndex           = 3
+    accent.Parent           = panel.frame
+    panel.accent = accent
 
-    -- Optional hover list (chakra sense uses it for the names).
+    -- Everything below the stripes, so the row centres on the body rather
+    -- than on the whole panel and sits visually level.
+    local body = Instance.new("Frame")
+    body.BackgroundTransparency = 1
+    body.Position = UDim2.new(0, 0, 0, BAR * 2)
+    body.Size     = UDim2.new(1, 0, 1, -BAR * 2)
+    body.ZIndex   = 3
+    body.Parent   = panel.frame
+
+    local x = 8
+
+    if opts.icon then
+        panel.icon = Instance.new("ImageLabel")
+        panel.icon.AnchorPoint            = Vector2.new(0, 0.5)
+        panel.icon.Position               = UDim2.new(0, x, 0.5, 0)
+        panel.icon.Size                   = UDim2.new(0, 14, 0, 14)
+        panel.icon.BackgroundTransparency = 1
+        panel.icon.Image                  = opts.icon
+        panel.icon.ImageColor3            = panel.accentColor
+        panel.icon.ZIndex                 = 4
+        panel.icon.Parent                 = body
+        x = x + 21
+    end
+
+    -- Left: what is being reported. Dim, because it rarely changes.
+    panel.caption = Instance.new("TextLabel")
+    panel.caption.AnchorPoint            = Vector2.new(0, 0.5)
+    panel.caption.Position               = UDim2.new(0, x, 0.5, 0)
+    panel.caption.Size                   = UDim2.new(1, -(x + 104), 0, 16)
+    panel.caption.BackgroundTransparency = 1
+    panel.caption.Font                   = Enum.Font.Ubuntu
+    panel.caption.TextSize               = 13
+    panel.caption.TextColor3             = DIM
+    panel.caption.TextXAlignment         = Enum.TextXAlignment.Left
+    panel.caption.TextTruncate           = Enum.TextTruncate.AtEnd
+    panel.caption.Text                   = opts.label or ""
+    panel.caption.ZIndex                 = 4
+    panel.caption.Parent                 = body
+
+    -- Right: the state. Carries the accent colour.
+    panel.value = Instance.new("TextLabel")
+    panel.value.AnchorPoint            = Vector2.new(1, 0.5)
+    panel.value.Position               = UDim2.new(1, -8, 0.5, 0)
+    panel.value.Size                   = UDim2.new(0, 96, 0, 16)
+    panel.value.BackgroundTransparency = 1
+    panel.value.Font                   = Enum.Font.Ubuntu
+    panel.value.TextSize               = 13
+    panel.value.TextColor3             = WHITE
+    panel.value.TextXAlignment         = Enum.TextXAlignment.Right
+    panel.value.TextTruncate           = Enum.TextTruncate.AtEnd
+    panel.value.Text                   = ""
+    panel.value.ZIndex                 = 4
+    panel.value.Parent                 = body
+
+    -- The old two-label names still work, so existing callers are unaffected.
+    panel.left  = panel.caption
+    panel.right = panel.value
+
+    local TS = K.Services.TweenService
+
+    -- One call for the whole state, tweened, so a flick between states reads
+    -- as a change rather than a flash.
+    function panel.set_state(text, colour)
+        if panel.value.Text == text and panel._state == colour then return end
+        panel._state      = colour
+        panel.accentColor = colour
+        panel.value.Text  = text
+
+        local info = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+        TS:Create(accent,      info, { BackgroundColor3 = colour }):Play()
+        TS:Create(panel.value, info, { TextColor3 = colour }):Play()
+        if panel.icon then
+            TS:Create(panel.icon, info, { ImageColor3 = colour }):Play()
+        end
+    end
+
+    -- Optional hover list (chakra sense and proximity both use it).
     if opts.list then
+        local ROW_H = 17
+
         panel.list = Instance.new("Frame")
-        panel.list.Size             = UDim2.new(0, 220, 0, 0)
-        panel.list.Position         = UDim2.new(0, 0, 1, 6)
-        panel.list.BackgroundColor3 = Color3.fromRGB(18, 22, 28)
+        panel.list.Size             = UDim2.new(0, W, 0, 0)
+        panel.list.Position         = UDim2.new(0, 0, 1, 4)
+        panel.list.BackgroundColor3 = BODY
         panel.list.BorderSizePixel  = 0
         panel.list.Visible          = false
         panel.list.ClipsDescendants = true
         panel.list.ZIndex           = 6
         panel.list.Parent           = panel.frame
 
-        local listCorner = Instance.new("UICorner")
-        listCorner.CornerRadius = UDim.new(0, 8)
-        listCorner.Parent       = panel.list
-
         local listStroke = Instance.new("UIStroke")
-        listStroke.Color     = Color3.fromRGB(152, 84, 255)
+        listStroke.Color     = EDGE
         listStroke.Thickness = 1
         listStroke.Parent    = panel.list
 
         local layout = Instance.new("UIListLayout")
         layout.FillDirection = Enum.FillDirection.Vertical
-        layout.SortOrder     = Enum.SortOrder.Name
-        layout.Padding       = UDim.new(0, 2)
+        layout.SortOrder     = Enum.SortOrder.LayoutOrder
         layout.Parent        = panel.list
 
         local padding = Instance.new("UIPadding")
@@ -5476,35 +6443,83 @@ local function makePanel(opts)
             panel.list.Visible = false
         end))
 
-        -- Replace the whole list. Entry count drives the height, so a panel
-        -- with nothing in it never opens an empty box.
+        -- entries: either plain strings, or
+        --   { text = "name", colour = Color3, note = "sensing" }
+        -- Entry count drives the height, so a panel with nothing in it never
+        -- opens an empty box.
         function panel.set_list(entries)
-            -- Rebuilding eight TextLabels ten times a second for a list that
-            -- has not changed is pure churn; key off the contents instead.
-            local key = table.concat(entries, "")
+            -- Rebuilding the rows ten times a second for a list that has not
+            -- changed is pure churn; key off the contents instead.
+            local parts = {}
+            for i, e in ipairs(entries) do
+                if type(e) == "table" then
+                    parts[i] = e.text .. "|" .. tostring(e.note)
+                else
+                    parts[i] = tostring(e)
+                end
+            end
+            local key = table.concat(parts, "\1")
             if key == panel._key then return end
             panel._key = key
 
             for _, child in ipairs(panel.list:GetChildren()) do
-                if child:IsA("TextLabel") then child:Destroy() end
+                if child:IsA("Frame") then child:Destroy() end
             end
 
-            for _, entry in ipairs(entries) do
-                local row = Instance.new("TextLabel")
+            for i, e in ipairs(entries) do
+                local isTable = type(e) == "table"
+                local text    = isTable and e.text or tostring(e)
+                local note    = isTable and e.note or nil
+                local colour  = (isTable and e.colour) or DIM
+
+                local row = Instance.new("Frame")
+                row.Size                   = UDim2.new(1, 0, 0, ROW_H)
                 row.BackgroundTransparency = 1
-                row.Size           = UDim2.new(1, 0, 0, 16)
-                row.Font           = Enum.Font.Gotham
-                row.TextSize       = 13
-                row.TextColor3     = Color3.fromRGB(230, 230, 230)
-                row.TextXAlignment = Enum.TextXAlignment.Left
-                row.Text           = entry
-                row.Name           = entry
-                row.ZIndex         = 7
-                row.Parent         = panel.list
+                row.LayoutOrder            = i
+                row.ZIndex                 = 7
+                row.Parent                 = panel.list
+
+                -- Square pip, not a dot: the rest of the HUD has no curves.
+                local pip = Instance.new("Frame")
+                pip.AnchorPoint      = Vector2.new(0, 0.5)
+                pip.Position         = UDim2.new(0, 0, 0.5, 0)
+                pip.Size             = UDim2.new(0, 4, 0, 4)
+                pip.BackgroundColor3 = colour
+                pip.BorderSizePixel  = 0
+                pip.ZIndex           = 8
+                pip.Parent           = row
+
+                local who = Instance.new("TextLabel")
+                who.BackgroundTransparency = 1
+                who.Position       = UDim2.new(0, 12, 0, 0)
+                who.Size           = UDim2.new(1, -(note and 84 or 12), 1, 0)
+                who.Font           = Enum.Font.Ubuntu
+                who.TextSize       = 13
+                who.TextColor3     = WHITE
+                who.TextXAlignment = Enum.TextXAlignment.Left
+                who.TextTruncate   = Enum.TextTruncate.AtEnd
+                who.Text           = text
+                who.ZIndex         = 8
+                who.Parent         = row
+
+                if note then
+                    local tag = Instance.new("TextLabel")
+                    tag.AnchorPoint            = Vector2.new(1, 0.5)
+                    tag.Position               = UDim2.new(1, 0, 0.5, 0)
+                    tag.Size                   = UDim2.new(0, 72, 1, 0)
+                    tag.BackgroundTransparency = 1
+                    tag.Font                   = Enum.Font.Ubuntu
+                    tag.TextSize               = 12
+                    tag.TextColor3             = colour
+                    tag.TextXAlignment         = Enum.TextXAlignment.Right
+                    tag.Text                   = note
+                    tag.ZIndex                 = 8
+                    tag.Parent                 = row
+                end
             end
 
             panel.rows      = #entries
-            panel.list.Size = UDim2.new(0, 220, 0, math.min(#entries, 8) * 18 + 10)
+            panel.list.Size = UDim2.new(0, W, 0, math.min(#entries, 8) * ROW_H + 10)
             if #entries == 0 then panel.list.Visible = false end
         end
     end
@@ -5553,7 +6568,7 @@ do
     local UIS         = K.Services.UserInputService
 
     local GREY   = Color3.fromRGB(58, 58, 66)
-    local PURPLE = Color3.fromRGB(152, 84, 255)
+    local PURPLE = Color3.fromRGB(255, 255, 255)
     local W_MIN, ROW_H, HEAD_H, FONT_SIZE = 150, 18, 26, 13
 
     local KB = { frame = nil, list = nil, sig = nil, running = false }
@@ -5594,7 +6609,7 @@ do
         title.BackgroundTransparency = 1
         title.Position       = UDim2.new(0, 8, 0, 4)
         title.Size           = UDim2.new(1, -16, 0, HEAD_H - 4)
-        title.Font           = Enum.Font.GothamBold
+        title.Font           = Enum.Font.Ubuntu
         title.TextSize       = 14
         title.TextColor3     = Color3.fromRGB(255, 255, 255)
         title.TextXAlignment = Enum.TextXAlignment.Left
@@ -5658,7 +6673,7 @@ do
         local row = Instance.new("TextLabel")
         row.BackgroundTransparency = 1
         row.Size           = UDim2.new(1, 0, 0, ROW_H)
-        row.Font           = Enum.Font.Gotham
+        row.Font           = Enum.Font.Ubuntu
         row.TextSize       = FONT_SIZE
         row.TextColor3     = color or Color3.fromRGB(230, 230, 230)
         row.TextXAlignment = Enum.TextXAlignment.Left
@@ -5667,7 +6682,7 @@ do
         row.LayoutOrder    = order
         row.ZIndex         = 3
         row.Parent         = KB.list
-        local size = TextService:GetTextSize(plain, FONT_SIZE, Enum.Font.Gotham, Vector2.new(1000, ROW_H))
+        local size = TextService:GetTextSize(plain, FONT_SIZE, Enum.Font.Ubuntu, Vector2.new(1000, ROW_H))
         return size.X
     end
 
@@ -5981,9 +6996,9 @@ yield(true)
 ---------------------------------------------------------------------
 -- SECURITY :: SAFE TELEPORT UI
 ---------------------------------------------------------------------
-UI.boxSafeTp.element("Toggle", "Safe Teleport", ON, function(v)
+UI.boxSafeTp.element("Toggle", "Player Detection Range", ON, function(v)
     Safe.enabled = v.Toggle
-    notify("Security", "Safe Teleport " .. (v.Toggle and "enabled" or "disabled"))
+    notify("Security", "Player Detection Range " .. (v.Toggle and "enabled" or "disabled"))
 end)
 
 UI.boxSafeTp.element("Slider", "Detection Range", {
@@ -6084,9 +7099,16 @@ local function refreshObservedFlag()
 end
 
 ---------------------------------------------------------------------
--- The readout: a count on the left, a state on the right, and the names
--- themselves on hover. Green = nobody, orange = somebody has it equipped,
--- red = somebody is actively sensing right now.
+-- The readout. Three states, worst-first, each with its own colour that the
+-- whole panel adopts:
+--
+--   red     somebody is sensing right now
+--   amber   somebody has it equipped but is not using it
+--   white   nobody in the server has it
+--
+-- The readout is the headcount - "None", or "Users: 3" - and the colour is
+-- what those users are doing, so one glance gives both. The names, and which
+-- of them is doing what, live on hover where they are not in the way.
 ---------------------------------------------------------------------
 local function refreshSensePanel()
     local panel = Sense.panel
@@ -6101,36 +7123,48 @@ local function refreshSensePanel()
     end
     table.sort(names)
 
-    panel.left.Text = "Chakra Sense Users: " .. #names
+    -- White is the menu accent and means "nothing going on", so the panel
+    -- sits quiet until it has something to say; only a real threat colours it.
+    local RED   = Color3.fromRGB(255,  28,  28)   -- same red the menu uses
+    local AMBER = Color3.fromRGB(255, 170,  40)
+    local CALM  = Color3.fromRGB(255, 255, 255)
+    local GREY  = Color3.fromRGB(150, 150, 150)
 
-    if next(Sense.observing) then
-        panel.right.Text       = "Spectators = Active"
-        panel.right.TextColor3 = Color3.fromRGB(239, 68, 68)
-    elseif next(Sense.hovering) then
-        panel.right.Text       = "Spectators = Equipped"
-        panel.right.TextColor3 = Color3.fromRGB(255, 165, 0)
+    local sensing, equipped = 0, 0
+    for _ in pairs(Sense.observing) do sensing  = sensing  + 1 end
+    for _ in pairs(Sense.hovering)  do equipped = equipped + 1 end
+
+    if #names == 0 then
+        panel.set_state("None", CALM)
+    elseif sensing > 0 then
+        panel.set_state("Users: " .. #names, RED)
+    elseif equipped > 0 then
+        panel.set_state("Users: " .. #names, AMBER)
     else
-        panel.right.Text       = "Spectators = None"
-        panel.right.TextColor3 = Color3.fromRGB(34, 197, 94)
+        panel.set_state("Users: " .. #names, CALM)
     end
 
+    -- Sensing first, then equipped, then merely carrying it: the row order is
+    -- the threat order, so the top of the list is always the one that matters.
     local rows = {}
-    for _, name in ipairs(names) do
-        if Sense.observing[name] then
-            rows[#rows + 1] = name .. "  (sensing)"
-        elseif Sense.hovering[name] then
-            rows[#rows + 1] = name .. "  (equipped)"
-        else
-            rows[#rows + 1] = name
+    local function push(pred, note, colour)
+        for _, name in ipairs(names) do
+            if pred(name) then
+                rows[#rows + 1] = { text = name, note = note, colour = colour }
+            end
         end
     end
+    push(function(n) return Sense.observing[n] ~= nil end, "sensing", RED)
+    push(function(n) return Sense.observing[n] == nil and Sense.hovering[n] ~= nil end, "equipped", AMBER)
+    push(function(n) return Sense.observing[n] == nil and Sense.hovering[n] == nil end, "has it", GREY)
+
     panel.set_list(rows)
 end
 
 local function senseEvaluate()
     if not Sense.enabled then return end
 
-    local cooldowns = RepStorage:FindFirstChild("Cooldowns")
+    local cooldowns = cooldownsFolder()
     local settings  = gameSettings()
 
     if cooldowns then
@@ -6153,12 +7187,12 @@ local function senseEvaluate()
                     if not Sense.observing[name] then
                         Sense.observing[name] = true
                         notify("Chakra Sense", "You are being observed by " .. name, 5)
-                        playSenseSound("124951621656853")
+                        playSenseSound("107089652181213")
                     end
                 elseif Sense.observing[name] then
                     Sense.observing[name] = nil
                     notify("Chakra Sense", name .. " stopped observing you")
-                    playSenseSound("8551372796")
+                    playSenseSound("98797174600699")
                 end
             end
         end
@@ -6228,7 +7262,11 @@ local function senseStart()
     if #Sense.conns > 0 then return end
 
     if not Sense.panel then
-        Sense.panel = makePanel({ width = 400, height = 46, y = 20, list = true })
+        Sense.panel = makePanel({
+            width = 260, height = 38, y = 18, list = true,
+            icon  = "rbxassetid://10723346959",   -- eye
+            label = "Chakra Sense",
+        })
     end
     Sense.panel.frame.Visible = true
     refreshSensePanel()
@@ -6264,7 +7302,7 @@ local function senseStart()
         end))
     end
 
-    local cooldowns = RepStorage:FindFirstChild("Cooldowns")
+    local cooldowns = cooldownsFolder()
     if cooldowns then
         hookCooldowns(cooldowns)
     else
@@ -6490,7 +7528,7 @@ local function masteryCheckClear()
         if Mastery.toggle then
             Mastery.toggle:set_value({ Toggle = false }, true)
         end
-        notify("Farm", "Chakra sense detected - mastery farm stopped", 6)
+        notify("Farm", "Chakra sense detected - activations farm stopped", 6)
         return false
     end
 
@@ -6594,14 +7632,14 @@ UI.mastery.element("TextBox", "Skill / Mode Name", { maxlen = 120 }, function(v)
     Mastery.input = v.Text
 end)
 
-Mastery.toggle = UI.mastery.element("Toggle", "Auto Farm Mastery", nil, function(v)
+Mastery.toggle = UI.mastery.element("Toggle", "Auto Farm Activations", nil, function(v)
     Mastery.enabled = v.Toggle
 
     if v.Toggle then
         masteryStart()
     else
         masteryStop()
-        notify("Farm", "Auto Farm Mastery disabled")
+        notify("Farm", "Auto Farm Activations disabled")
     end
 end)
 
@@ -7796,29 +8834,7 @@ UI.ramen.element("Button", "Eat Now (one round)", nil, function()
 end)
 
 UI.ramen.create_line()
-
-UI.ramen.element("Slider", "Bowls", {
-    default = { min = 1, max = 15, default = 15 },
-}, function(v)
-    Ramen.bowls = v.Slider
-end)
-
-UI.ramen.element("Slider", "Eat Pace", {
-    default = { min = 200, max = 2000, default = 1200 },
-    suffix  = " ms",
-}, function(v)
-    Ramen.gap = v.Slider / 1000
-end)
-
-UI.ramen.element("Slider", "Start Delay", {
-    default = { min = 0, max = 30, default = 10 },
-    suffix  = " s",
-}, function(v)
-    Ramen.startDelay = v.Slider
-end)
-
-UI.ramen.element("Label", "Needs Akimichi + Butterfly Mode")
-UI.ramen.element("Label", "and 15x Ramen per round.")
+UI.ramen.element("Label", "needs akimichi + Butterfly Mode and 15 ramen")
 
 yield(true)
 
@@ -8065,7 +9081,7 @@ do
     -- cooldown. The game's own getCooldown (what its cooldown UI uses) is
     -- asked for the length, falling back to the base 30s.
     local function onCooldown(skill, fallback)
-        local all  = RepStorage:FindFirstChild("Cooldowns")
+        local all  = cooldownsFolder()
         local mine = all and all:FindFirstChild(LP.Name)
         local used = mine and mine:FindFirstChild(skill)
         if not used then return false end
@@ -8246,7 +9262,7 @@ end
 ---------------------------------------------------------------------
 do
     local UIS = K.Services.UserInputService
-    local RS_NAME = "KyoAntiAttachRestore"
+    local RS_NAME = "SysAntiAttachRestore"
     local DEPTH_MIN, DEPTH_MAX, SIDE = 18, 30, 14
     local MOVEMENT = {
         W = true, A = true, S = true, D = true, Space = true,
@@ -8518,7 +9534,7 @@ do
                 if K.flags.autoTotsuka then hunt() end
             end)
         end
-        local all  = RepStorage:FindFirstChild("Cooldowns")
+        local all  = cooldownsFolder()
         local mine = all and all:FindFirstChild(LP.Name)
         if mine then
             local entry = mine:FindFirstChild(AMA)
@@ -8698,7 +9714,7 @@ do
         local fov     = cfg.fov
         local best, bestScore = nil, math.huge
 
-        for _, plr in ipairs(Players:GetPlayers()) do
+        for _, plr in ipairs(playerList()) do
             local char = plr ~= LP and plr.Character
             local hrp  = char and char:FindFirstChild("HumanoidRootPart")
             if hrp then
@@ -9659,8 +10675,7 @@ yield(true)
 -- already reads "FinishedGood" has been spent and cannot be used again.
 --
 -- The unwipe itself is just StartQuest on both, then reading the progress
--- back to make the server commit it. The black overlay is cosmetic - it hides
--- the respawn flicker while the server works.
+-- back to make the server commit it.
 --
 -- Eligibility is worth checking first because starting a quest you cannot
 -- finish spends nothing but tells you nothing either: each quest also wants
@@ -9758,29 +10773,6 @@ do
                 return
             end
 
-            -- Cosmetic cover for the respawn flicker while the server works.
-            local overlay = Instance.new("ScreenGui")
-            overlay.Name           = K.Services.HttpService:GenerateGUID(false)
-            overlay.IgnoreGuiInset = true
-            overlay.DisplayOrder   = 999
-            overlay.ResetOnSpawn   = false
-            overlay.Parent         = hiddenParent()
-
-            local black = Instance.new("Frame")
-            black.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-            black.Size             = UDim2.new(1, 0, 1, 0)
-            black.BorderSizePixel  = 0
-            black.Parent           = overlay
-
-            local text = Instance.new("TextLabel")
-            text.BackgroundTransparency = 1
-            text.Size       = UDim2.new(1, 0, 1, 0)
-            text.Font       = Enum.Font.Ubuntu
-            text.Text       = "Unwiping"
-            text.TextColor3 = Color3.fromRGB(255, 255, 255)
-            text.TextSize   = 48
-            text.Parent     = black
-
             pcall(function()
                 for _, q in ipairs(QUESTS) do
                     dataFunction():InvokeServer("StartQuest", q.quest)
@@ -9796,7 +10788,6 @@ do
                 task.wait(4)
             end)
 
-            pcall(function() overlay:Destroy() end)
             notify("Unwipe", "Unwipe done", 4)
         end)
     end)
@@ -9817,252 +10808,6 @@ yield(true)
 ---------------------------------------------------------------------
 local RO = {}
 
----------------------------------------------------------------------
--- ITEM ESP
---
--- A dropped item is a direct child of workspace carrying an "ID" child -
--- that one test is what separates loot from scenery, and it is what the game
--- itself uses. The nearest-player readout answers the only question that
--- actually matters about a drop: can you get there before they do.
----------------------------------------------------------------------
-RO.item = {
-    enabled       = false,
-    showName      = true,
-    showDistance  = true,
-    showNearest   = true,
-    maxDistance   = 500,
-    textSize      = 14,
-    nameColor     = Color3.fromRGB(255, 220, 120),
-    distanceColor = Color3.fromRGB(200, 200, 200),
-    nearestColor  = Color3.fromRGB(255, 120, 120),
-    objects       = {},
-    conn          = nil,
-    scan          = 0,
-    list          = {},
-}
-
-local function itemDrawings(item)
-    if RO.item.objects[item] then return end
-    RO.item.objects[item] = {
-        NameTag     = textDrawing(14),
-        DistanceTag = textDrawing(12),
-        NearestTag  = textDrawing(12),
-    }
-end
-
-local function clearItemESP()
-    for _, data in pairs(RO.item.objects) do destroyDrawings(data) end
-    RO.item.objects = {}
-    RO.item.list    = {}
-end
-
-local function itemPart(item)
-    if item:IsA("BasePart") then return item end
-    return item.PrimaryPart or item:FindFirstChildWhichIsA("BasePart")
-end
-
-local function renderItemESP()
-    if not RO.item.enabled then return end
-
-    local cam = workspace.CurrentCamera
-    local myRoot = root()
-    if not cam or not myRoot then return end
-
-    -- Rescanning workspace every frame is the expensive part, so the item
-    -- list is rebuilt twice a second and only the drawing work is per-frame.
-    local now = os.clock()
-    if now - RO.item.scan > 0.5 then
-        RO.item.scan = now
-        local found = {}
-        for _, child in ipairs(workspace:GetChildren()) do
-            if (child:IsA("BasePart") or child:IsA("Model")) and child:FindFirstChild("ID") then
-                found[#found + 1] = child
-            end
-        end
-        RO.item.list = found
-
-        for item, data in pairs(RO.item.objects) do
-            if not item.Parent then
-                destroyDrawings(data)
-                RO.item.objects[item] = nil
-            end
-        end
-    end
-
-    local W2VP = cam.WorldToViewportPoint
-
-    for _, item in ipairs(RO.item.list) do
-        local part = itemPart(item)
-        local data = RO.item.objects[item]
-
-        if not part then
-            hideDrawings(data)
-            continue
-        end
-
-        local distance = (part.Position - myRoot.Position).Magnitude
-        if distance > RO.item.maxDistance then
-            hideDrawings(data)
-            continue
-        end
-
-        local screen, onScreen = W2VP(cam, part.Position + Vector3.new(0, 1.5, 0))
-        if not onScreen then
-            hideDrawings(data)
-            continue
-        end
-
-        if not data then
-            itemDrawings(item)
-            data = RO.item.objects[item]
-            if not data then continue end
-        end
-
-        local y = screen.Y
-
-        if RO.item.showName then
-            data.NameTag.Visible  = true
-            data.NameTag.Position = Vector2.new(screen.X, y)
-            data.NameTag.Text     = item.Name
-            data.NameTag.Color    = RO.item.nameColor
-            data.NameTag.Size     = RO.item.textSize
-            y = y + RO.item.textSize
-        else
-            data.NameTag.Visible = false
-        end
-
-        if RO.item.showDistance then
-            data.DistanceTag.Visible  = true
-            data.DistanceTag.Position = Vector2.new(screen.X, y)
-            data.DistanceTag.Text     = string.format("%d studs", math.floor(distance))
-            data.DistanceTag.Color    = RO.item.distanceColor
-            data.DistanceTag.Size     = RO.item.textSize - 2
-            y = y + RO.item.textSize - 1
-        else
-            data.DistanceTag.Visible = false
-        end
-
-        if RO.item.showNearest then
-            local best, bestDist = nil, math.huge
-            for _, p in ipairs(Players:GetPlayers()) do
-                if p ~= LP then
-                    local char = p.Character
-                    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
-                    if hrp then
-                        local d = (hrp.Position - part.Position).Magnitude
-                        if d < bestDist then best, bestDist = p, d end
-                    end
-                end
-            end
-
-            if best then
-                data.NearestTag.Visible  = true
-                data.NearestTag.Position = Vector2.new(screen.X, y)
-                data.NearestTag.Text     = string.format("%s (%d)", best.Name, math.floor(bestDist))
-                data.NearestTag.Color    = RO.item.nearestColor
-                data.NearestTag.Size     = RO.item.textSize - 2
-            else
-                data.NearestTag.Visible = false
-            end
-        else
-            data.NearestTag.Visible = false
-        end
-    end
-end
-
-UI.itemESP.element("Toggle", "Enable Item ESP", nil, function(v)
-    if v.Toggle and not drawingAvailable() then return end
-    RO.item.enabled = v.Toggle
-
-    if v.Toggle then
-        RO.item.scan = 0
-        if not RO.item.conn then
-            RO.item.conn = bind(RunService.RenderStepped:Connect(function()
-                pcall(renderItemESP)
-            end))
-        end
-    else
-        if RO.item.conn then
-            unbind(RO.item.conn)
-            RO.item.conn = nil
-        end
-        clearItemESP()
-    end
-
-    notify("Visuals", "Item ESP " .. (v.Toggle and "enabled" or "disabled"))
-end)
-
-UI.itemESP.create_line()
-
-UI.itemESP.element("Toggle", "Show Item Name", { default = { Toggle = true } }, function(v)
-    RO.item.showName = v.Toggle
-end):add_color({ Color = RO.item.nameColor }, false, function(c)
-    RO.item.nameColor = c.Color
-end)
-
-UI.itemESP.element("Toggle", "Show Item Distance", { default = { Toggle = true } }, function(v)
-    RO.item.showDistance = v.Toggle
-end)
-
-UI.itemESP.element("Toggle", "Show Nearest Player", { default = { Toggle = true } }, function(v)
-    RO.item.showNearest = v.Toggle
-end):add_color({ Color = RO.item.nearestColor }, false, function(c)
-    RO.item.nearestColor = c.Color
-end)
-
-UI.itemESP.element("Slider", "Item Max Distance", {
-    default = { min = 50, max = 2000, default = 500 },
-    suffix  = " studs",
-}, function(v)
-    RO.item.maxDistance = v.Slider
-end)
-
-UI.itemESP.element("Slider", "Item Text Size", {
-    default = { min = 10, max = 24, default = 14 },
-}, function(v)
-    RO.item.textSize = v.Slider
-end)
-
-yield()
-
----------------------------------------------------------------------
--- FIELD OF VIEW
---
--- Bound at RenderPriority.Last so our write lands AFTER the game's camera
--- module (priority Camera = 200). A plain RenderStepped connection runs
--- before it, and the game overwrites the value every frame.
----------------------------------------------------------------------
-RO.fov = { enabled = false, value = 70, bound = false, key = "kyo_fov_" .. tostring(math.random(1000, 9999)) }
-
-UI.camera.element("Toggle", "Custom FOV", nil, function(v)
-    RO.fov.enabled = v.Toggle
-
-    if v.Toggle then
-        if not RO.fov.bound then
-            RO.fov.bound = true
-            RunService:BindToRenderStep(RO.fov.key, Enum.RenderPriority.Last.Value, function()
-                local cam = workspace.CurrentCamera
-                if cam and cam.FieldOfView ~= RO.fov.value then
-                    cam.FieldOfView = RO.fov.value
-                end
-            end)
-        end
-    else
-        if RO.fov.bound then
-            RO.fov.bound = false
-            pcall(function() RunService:UnbindFromRenderStep(RO.fov.key) end)
-        end
-        pcall(function() workspace.CurrentCamera.FieldOfView = 70 end)
-    end
-end)
-
-UI.camera.element("Slider", "FOV", {
-    default = { min = 40, max = 160, default = 70 },
-}, function(v)
-    RO.fov.value = v.Slider
-end)
-
-UI.camera.create_line()
 
 ---------------------------------------------------------------------
 -- STRETCHED RESOLUTION
@@ -10087,11 +10832,13 @@ RO.stretch = {
     enabled = false,
     ratio   = 80,       -- percent; 100 is unstretched
     bound   = false,
-    key     = "kyo_stretch_" .. tostring(math.random(1000, 9999)),
+    key     = "sys_stretch_" .. tostring(math.random(1000, 9999)),
     last    = nil,
 }
 
-local function stretchStep()
+-- Not virtualised: pure camera matrix maths, bound at RenderPriority.Last so
+-- it runs after the camera module every single frame.
+local stretchStep = LPH_NO_VIRTUALIZE(function()
     local cam = workspace.CurrentCamera
     if not cam then return end
 
@@ -10106,7 +10853,7 @@ local function stretchStep()
 
     cam.CFrame      = scaled
     RO.stretch.last = scaled
-end
+end)
 
 local function stretchStop()
     if RO.stretch.bound then
@@ -10519,40 +11266,84 @@ end))
 ---------------------------------------------------------------------
 -- SERVER INFO
 ---------------------------------------------------------------------
-UI.server.element("Button", "Copy Job ID", nil, function()
-    if not setclipboard then
-        notify("Server", game.JobId, 8)
-        return
+UI.server.element("Button", "Copy Server ID", nil, function()
+    local id = game.JobId
+    if setclipboard then
+        pcall(setclipboard, id)
+        notify("Server", "Server ID copied: " .. string.sub(id, 1, 20) .. "...", 5)
+    else
+        notify("Server", id, 8)
     end
-    pcall(setclipboard, game.JobId)
-    notify("Server", "Job ID copied")
 end)
 
-UI.server.element("Button", "Copy Join Command", nil, function()
-    local cmd = string.format(
-        'game:GetService("TeleportService"):TeleportToPlaceInstance(%d, "%s", game:GetService("Players").LocalPlayer)',
-        game.PlaceId, game.JobId
-    )
-    if not setclipboard then
-        notify("Server", "Clipboard unavailable", 4)
-        return
-    end
-    pcall(setclipboard, cmd)
-    notify("Server", "Join command copied")
-end)
+-- Paste a JobId and jump straight to it, through the game's own
+-- ServerTeleport rather than TeleportService.
+do
+    local target = ""
 
-UI.server.element("Button", "Server Info", nil, function()
-    local ping = "?"
-    pcall(function()
-        local stat = game:GetService("Stats").Network.ServerStatsItem["Data Ping"]
-        ping = string.format("%.0f ms", stat:GetValue())
+    UI.server.element("TextBox", "Target Server ID", { maxlen = 60 }, function(v)
+        target = (v.Text or ""):gsub("%s+", "")
     end)
 
-    notify("Server", string.format("%d/%d players  |  up %d min  |  %s",
-        #Players:GetPlayers(),
-        Players.MaxPlayers,
-        math.floor(workspace.DistributedGameTime / 60),
-        ping), 8)
+    UI.server.element("Button", "Join Server", nil, function()
+        if target == "" then
+            notify("Server", "Paste a server ID first", 4)
+            return
+        end
+        notify("Server", "Teleporting...", 3)
+        task.spawn(function()
+            local ok = pcall(function()
+                RepStorage:WaitForChild("Events"):WaitForChild("DataEvent")
+                    :FireServer("ServerTeleport", target, 14)
+            end)
+            if not ok then
+                pcall(function()
+                    game:GetService("TeleportService")
+                        :TeleportToPlaceInstance(game.PlaceId, target, LP)
+                end)
+            end
+        end)
+    end)
+end
+
+UI.server.create_line()
+
+-- Server name and region come from the game's own HUD labels, which is where
+-- the readable values live - there is no remote that returns them.
+UI.server.element("Button", "Server Info", nil, function()
+    local serverName, region = "Unknown", "Unknown"
+
+    pcall(function()
+        local gui = LP:FindFirstChildOfClass("PlayerGui")
+        local mf  = gui and gui:FindFirstChild("ClientGui")
+        mf = mf and mf:FindFirstChild("Mainframe")
+        if not mf then return end
+
+        local rest = mf:FindFirstChild("Rest")
+        local menu = rest and rest:FindFirstChild("MainMenuFrame")
+        local nameLabel = menu and menu:FindFirstChild("ServerName")
+        if nameLabel and nameLabel.Text then
+            local got = string.match(nameLabel.Text, ":%s*(.+)")
+            if got and #(got:gsub("%s+", "")) > 0 then serverName = got end
+        end
+
+        local loadout = mf:FindFirstChild("Loadout")
+        local top     = loadout and loadout:FindFirstChild("TopFrame")
+        local regLabel = top and top:FindFirstChild("Region")
+        if regLabel and regLabel.Text then
+            local got = string.match(regLabel.Text, ":%s*(.+)")
+            region = (got and #(got:gsub("%s+", "")) > 0) and got or "Blank Region"
+        end
+    end)
+
+    local ping = "?"
+    pcall(function()
+        ping = string.format("%.0f ms",
+            game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue())
+    end)
+
+    notify("Server", string.format("%s  |  %s  |  %d/%d  |  %s",
+        serverName, region, #Players:GetPlayers(), Players.MaxPlayers, ping), 8)
 end)
 
 yield()
@@ -10560,48 +11351,7 @@ yield()
 ---------------------------------------------------------------------
 -- WATCHERS
 ---------------------------------------------------------------------
-RO.watch = { events = false, eventConn = nil, joins = false, joinConns = {} }
-
-UI.watchers.element("Toggle", "Event Notifier", nil, function(v)
-    RO.watch.events = v.Toggle
-
-    if v.Toggle then
-        RO.watch.eventConn = bind(workspace.ChildAdded:Connect(function(obj)
-            if not RO.watch.events then return end
-
-            if obj.Name == "CorruptedPoint" or obj.Name == "PresentPoint" then
-                notify("Event", obj.Name .. " spawned", 8)
-                return
-            end
-
-            -- World event NPCs stream their children in, so the tag is not
-            -- there on the frame the model arrives.
-            task.delay(1, function()
-                if not RO.watch.events or not obj.Parent then return end
-                if obj:FindFirstChild("WorldEvent") then
-                    notify("Event", "World event started: " .. obj.Name, 8)
-
-                    local hl = Instance.new("Highlight")
-                    hl.Name                = "kyo_event_marker"
-                    hl.DepthMode           = Enum.HighlightDepthMode.AlwaysOnTop
-                    hl.FillColor           = Color3.fromRGB(224, 57, 99)
-                    hl.OutlineColor        = Color3.fromRGB(224, 57, 99)
-                    hl.FillTransparency    = 0.7
-                    hl.Adornee             = obj
-                    pcall(function() hl.Parent = hiddenParent() end)
-                    K.Services.Debris:AddItem(hl, 120)
-                end
-            end)
-        end))
-        notify("Misc", "Event Notifier enabled")
-    else
-        if RO.watch.eventConn then
-            unbind(RO.watch.eventConn)
-            RO.watch.eventConn = nil
-        end
-        notify("Misc", "Event Notifier disabled")
-    end
-end)
+RO.watch = { joins = false, joinConns = {} }
 
 UI.watchers.element("Toggle", "Join / Leave Notifier", nil, function(v)
     RO.watch.joins = v.Toggle
@@ -10645,7 +11395,7 @@ local Prox = {
     panel         = nil,
     conn          = nil,
     ignoreVillage = false,
-    ignoreUsers   = "",
+    ignoreUsers   = {},   -- array of names, straight from the Combo
     warnRange     = 0,
     lastWarned    = {},
 }
@@ -10658,13 +11408,8 @@ local function proxIgnored(target)
         end
     end
 
-    if Prox.ignoreUsers ~= "" then
-        local lower = string.lower(target.Name)
-        for entry in string.gmatch(Prox.ignoreUsers, "[^,]+") do
-            if string.lower((entry:gsub("^%s*(.-)%s*$", "%1"))) == lower then
-                return true
-            end
-        end
+    if table.find(Prox.ignoreUsers, target.Name) then
+        return true
     end
 
     return false
@@ -10698,7 +11443,10 @@ UI.boxDetection.element("Toggle", "Player Proximity", nil, function(v)
 
     if v.Toggle then
         if not Prox.panel then
-            Prox.panel = makePanel({ width = 340, height = 38, y = 76, list = true })
+            Prox.panel = makePanel({
+                width = 260, height = 38, y = 62, list = true,
+                icon  = "rbxassetid://10747373176",   -- player
+            })
         end
         Prox.panel.frame.Visible = true
 
@@ -10716,19 +11464,26 @@ UI.boxDetection.element("Toggle", "Player Proximity", nil, function(v)
                 local rows = {}
 
                 if #near == 0 then
-                    Prox.panel.left.Text        = "Nearest: none"
-                    Prox.panel.right.Text       = ""
+                    Prox.panel.left.Text = "Nearby players"
+                    Prox.panel.set_state("None", Color3.fromRGB(255, 255, 255))
                 else
                     local first = near[1]
-                    Prox.panel.left.Text  = string.format("Nearest: %s", first.player.Name)
-                    Prox.panel.right.Text = string.format("%d studs", math.floor(first.distance))
-                    Prox.panel.right.TextColor3 =
-                        (Prox.warnRange > 0 and first.distance <= Prox.warnRange)
-                        and Color3.fromRGB(239, 68, 68)
-                        or Color3.fromRGB(34, 197, 94)
+                    local close = Prox.warnRange > 0 and first.distance <= Prox.warnRange
+                    Prox.panel.left.Text = first.player.Name
+                    Prox.panel.set_state(
+                        string.format("%d studs", math.floor(first.distance)),
+                        close and Color3.fromRGB(239, 68, 68) or Color3.fromRGB(34, 197, 94)
+                    )
 
                     for i = 1, math.min(#near, 8) do
-                        rows[i] = string.format("%s  -  %d", near[i].player.Name, math.floor(near[i].distance))
+                        local entry = near[i]
+                        rows[i] = {
+                            text   = entry.player.Name,
+                            note   = math.floor(entry.distance) .. " studs",
+                            colour = (Prox.warnRange > 0 and entry.distance <= Prox.warnRange)
+                                     and Color3.fromRGB(239, 68, 68)
+                                     or  Color3.fromRGB(120, 126, 138),
+                        }
                     end
                 end
 
@@ -10783,9 +11538,29 @@ UI.boxDetection.element("Toggle", "Proximity: Ignore Village", nil, function(v)
     Prox.ignoreVillage = v.Toggle
 end)
 
-UI.boxDetection.element("TextBox", "Ignore Users (comma sep)", { maxlen = 120 }, function(v)
-    Prox.ignoreUsers = v.Text
+local proxIgnoreCombo = UI.boxDetection.element("Combo", "Ignore Users", {
+    options = playerNames(),
+}, function(v)
+    Prox.ignoreUsers = v.Combo or {}
 end)
+
+UI.boxDetection.element("Button", "Refresh Ignore List", nil, function()
+    proxIgnoreCombo:refresh(playerNames(), true)
+    notify("Proximity", "Player list refreshed", 2)
+end)
+
+-- Keep the options current as people join and leave, without anyone pressing
+-- refresh; the picks themselves are kept, so somebody who rejoins stays
+-- ignored.
+bind(Players.PlayerAdded:Connect(function()
+    pcall(function() proxIgnoreCombo:refresh(playerNames(), true) end)
+end))
+
+bind(Players.PlayerRemoving:Connect(function()
+    task.defer(function()
+        pcall(function() proxIgnoreCombo:refresh(playerNames(), true) end)
+    end)
+end))
 
 yield(true)
 
@@ -10841,7 +11616,7 @@ end)
 ---------------------------------------------------------------------
 -- SETTINGS :: MENU
 ---------------------------------------------------------------------
-UI.boxMenu.element("Label", "Kyo - Private")
+UI.boxMenu.element("Label", "Sys - Private")
 UI.boxMenu.element("Label", "Toggle menu: Insert")
 UI.boxMenu.create_line()
 
@@ -10896,28 +11671,19 @@ local function unload()
 
     pcall(clearPlayerESP)
     pcall(clearMobESP)
-    if clearV2 then pcall(clearV2) end
 
     -- Read-only extras: camera bindings and lighting overrides have to be
     -- handed back explicitly, they are not connections.
-    RO.item.enabled     = false
     RO.freecam.enabled  = false
     RO.stretch.enabled  = false
-    RO.watch.events     = false
     RO.watch.joins      = false
     RO.world.fullbright = false
     RO.world.nofog      = false
 
-    pcall(clearItemESP)
     pcall(freecamStop)
     pcall(stretchStop)
     pcall(restoreWorld)
 
-    if RO.fov.bound then
-        RO.fov.bound = false
-        pcall(function() RunService:UnbindFromRenderStep(RO.fov.key) end)
-    end
-    pcall(function() workspace.CurrentCamera.FieldOfView = 70 end)
 
     if RO.spectate.enabled or RO.spectate.target then
         RO.spectate.enabled = false
@@ -10946,13 +11712,13 @@ local function unload()
     pcall(function() Atlas:unload() end)
 
     pcall(function()
-        getgenv().__kyo_priv = nil
+        getgenv().__sys_priv = nil
         getgenv()[_genvKey]  = nil
     end)
 end
 
 UI.boxMenu.element("Button", "Unload Script", nil, function()
-    notify("Kyo", "Unloading...", 2)
+    notify("Sys", "Unloading...", 2)
     task.delay(0.35, unload)
 end)
 
@@ -10963,9 +11729,15 @@ pcall(function()
     -- One small marker, under a per-run random key, plus the unload handle so
     -- a re-execute can retire this instance instead of stacking on top of it.
     getgenv()[_genvKey]  = os.clock()
-    getgenv().__kyo_priv = unload
+    getgenv().__sys_priv = unload
 end)
 
 yield(true)
 
-notify("Kyo - Private", "Loaded. Press Insert to toggle.", 5)
+-- The menu is ready, but the splash owns the screen until it finishes.
+task.spawn(function()
+    Splash.await()
+    Splash.hide()
+    Window.SetOpen(true)
+    notify("Sys - Private", "Loaded. Press Insert to toggle.", 5)
+end)
