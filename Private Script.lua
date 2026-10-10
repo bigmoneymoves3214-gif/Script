@@ -2642,6 +2642,18 @@ end
 -- ReplicatedStorage.Settings is read constantly by ESP, speed and the chakra
 -- sense watcher. Cache it for a couple of seconds rather than walking the
 -- service every frame from three different systems.
+-- ReplicatedStorage.Events.DataEvent. Walked to on demand rather than at
+-- load, because the folder is not guaranteed to exist the moment the script
+-- runs, and cached because the mastery farm teleports on a loop.
+local _dataEvent = nil
+
+local function dataEvent()
+    if _dataEvent and _dataEvent.Parent then return _dataEvent end
+    local events = RepStorage:FindFirstChild("Events")
+    _dataEvent = events and events:FindFirstChild("DataEvent")
+    return _dataEvent
+end
+
 local _settingsCache, _settingsCacheTime = nil, 0
 
 -- Players:GetPlayers() builds a fresh table on every call, and three hot
@@ -5907,6 +5919,18 @@ yield(true)
 -- Teleport on it refuses to move you to a spot with another player inside the
 -- detection radius, which is what stops a chakra point unlock run from
 -- blinking into somebody's face.
+--
+-- The move itself is asked of the server rather than written locally. "MoveMe"
+-- is the game's own teleport remote and takes an absolute CFrame - the ramen
+-- contest uses it to seat you and then put you back
+-- (gamescript.txt:9745 and 9833) - so the new position arrives as a
+-- server-authored move instead of a client rewriting its own root.
+--
+-- Two consequences worth knowing. It is a round trip, so a true return means
+-- "asked", not "arrived"; and it is a remote, so it cannot be re-asserted
+-- every frame the way a CFrame write could. The one caller that used to do
+-- that - the mastery farm parking through its spawn forcefield - now re-asks
+-- only when it has actually drifted.
 ---------------------------------------------------------------------
 local Safe = {
     enabled        = true,
@@ -5950,7 +5974,13 @@ local function safeTeleport(targetCFrame, skipCheck, exclude)
         end
     end
 
-    hrp.CFrame = targetCFrame
+    local remote = dataEvent()
+    if not remote then
+        notify("Teleport", "DataEvent remote not found")
+        return false
+    end
+
+    remote:FireServer("MoveMe", targetCFrame)
     return true
 end
 
@@ -7549,11 +7579,21 @@ local function masteryAwakenCycle(mode)
 
     -- Ride out the spawn forcefield. With resetting on we wait it out parked
     -- at the safespot; with it off we just wait where we are.
+    local lastPark = 0
     repeat
         task.wait()
         if not masteryCheckClear() then return end
-        if not Mastery.noReset then
-            pcall(function() safeTeleport(Mastery.spot or masterySafespot(), true) end)
+
+        -- Parking used to be re-written every frame, which was free; it is a
+        -- remote now, so it is re-asked at most twice a second and only once
+        -- we have actually drifted off the spot.
+        if not Mastery.noReset and os.clock() - lastPark > 0.5 then
+            local spot = Mastery.spot or masterySafespot()
+            local here = root()
+            if here and (here.Position - spot.Position).Magnitude > 5 then
+                lastPark = os.clock()
+                pcall(function() safeTeleport(spot, true) end)
+            end
         end
     until not char:FindFirstChild("ForceField") or char.Parent == nil or not Mastery.enabled
 
